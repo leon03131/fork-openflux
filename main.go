@@ -51,7 +51,16 @@ func run() error {
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token (oneme transport)")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	addr := flag.String("addr", "", "Address for the direct transport (client: exit address; exit: listen address)")
+	pskFlag := flag.String("psk", "", "Pre-shared key for v2 session encryption (or env OPENFLUX_PSK)")
 	flag.Parse()
+
+	psk := []byte(*pskFlag)
+	if len(psk) == 0 {
+		psk = []byte(os.Getenv("OPENFLUX_PSK"))
+	}
+	if *mode == "v2" && len(psk) == 0 {
+		log.Printf("WARNING: no --psk/OPENFLUX_PSK set - v2 session is UNENCRYPTED")
+	}
 
 	if *exitNode == *client {
 		// Exactly one mode must be selected.
@@ -103,7 +112,7 @@ func run() error {
 	defer stop()
 
 	if *mode == "v2" {
-		return runV2(ctx, trans, *exitNode, *socksAddr)
+		return runV2(ctx, trans, *exitNode, *socksAddr, psk)
 	}
 	if *mode != "legacy" {
 		return fmt.Errorf("unknown mode %q (want v2 or legacy)", *mode)
@@ -163,7 +172,7 @@ func (d *atomicDialer) DialTCP(address string) (net.Conn, error) {
 // A supervisor loop rebuilds the session whenever the carrier drops:
 // existing streams die with the old session (they cannot survive a
 // carrier reconnect), new connections use the fresh session.
-func runV2(ctx context.Context, trans transport.Transport, exitNode bool, socksAddr string) error {
+func runV2(ctx context.Context, trans transport.Transport, exitNode bool, socksAddr string, psk []byte) error {
 	if err := trans.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
 	}
@@ -180,7 +189,10 @@ func runV2(ctx context.Context, trans transport.Transport, exitNode bool, socksA
 	}
 
 	for ctx.Err() == nil {
-		sess := session.New(trans)
+		sess, err := session.New(trans, psk, !exitNode)
+		if err != nil {
+			return err
+		}
 		sess.Start()
 		if err := sess.Handshake(); err != nil {
 			sess.Close()

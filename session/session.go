@@ -8,6 +8,7 @@
 package session
 
 import (
+	"crypto/ecdh"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,9 +52,13 @@ type Session struct {
 	trans transport.Transport
 
 	maxPayload int // carrier message budget
-	// cryptoOverhead reserves bytes for the stage-7 AEAD tag so the mux
-	// never has to re-chunk when crypto is enabled.
+	// frameBudget is MaxPayload minus frame header and AEAD overhead.
 	frameBudget int
+
+	psk      []byte
+	isClient bool
+	priv     *ecdh.PrivateKey
+	crypto   atomic.Pointer[sessionCrypto]
 
 	handler   func(wire.Frame)
 	handlerMu sync.RWMutex
@@ -68,25 +73,37 @@ type Session struct {
 	helloCh chan error
 }
 
-func New(t transport.Transport) *Session {
+// New creates a session over the transport. With a non-nil PSK the
+// session performs an authenticated X25519 handshake and encrypts every
+// frame (ChaCha20-Poly1305). psk=nil disables crypto (tests only).
+func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 	maxP := defaultCarrierPayload
 	if pc, ok := t.(payloadCapacitor); ok && pc.MaxPayload() > 0 {
 		maxP = pc.MaxPayload()
 	}
 	s := &Session{
-		trans:        t,
-		maxPayload:   maxP,
-		closed:       make(chan struct{}),
-		helloCh:      make(chan error, 1),
-		lastRecvNano: atomic.Int64{},
+		trans:      t,
+		maxPayload: maxP,
+		psk:        psk,
+		isClient:   isClient,
+		closed:     make(chan struct{}),
+		helloCh:    make(chan error, 1),
 	}
 	s.lastRecvNano.Store(time.Now().UnixNano())
-	// cryptoOverhead(0) for now; stage 7 wraps SendFrame/dispatch.
-	s.frameBudget = maxP - wire.HeaderSize - 16
+	reserve := wire.HeaderSize
+	if psk != nil {
+		reserve += aeadOverhead
+		priv, err := generateEphemeralKey()
+		if err != nil {
+			return nil, fmt.Errorf("session: keygen: %w", err)
+		}
+		s.priv = priv
+	}
+	s.frameBudget = maxP - reserve
 	if s.frameBudget > wire.MaxPayload {
 		s.frameBudget = wire.MaxPayload
 	}
-	return s
+	return s, nil
 }
 
 // MaxFramePayload is the largest DATA payload the mux may put in one frame.
@@ -98,6 +115,19 @@ func (s *Session) MaxFramePayload() int { return s.frameBudget }
 // supervisor to build a fresh session over a reconnected carrier.
 func (s *Session) Start() error {
 	s.trans.Receive(func(msg []byte) {
+		if c := s.crypto.Load(); c != nil {
+			plain, err := c.decrypt(msg)
+			if err != nil {
+				n := c.consecutiveFailures.Add(1)
+				utils.Debugf("[SESSION] decrypt failed (%d): %v", n, err)
+				if n >= maxDecryptFailures {
+					s.CloseWithError(ErrCryptoMismatch)
+				}
+				return
+			}
+			c.consecutiveFailures.Store(0)
+			msg = plain
+		}
 		f, err := wire.Decode(msg)
 		if err != nil {
 			utils.Debugf("[SESSION] dropping undecodable message: %v", err)
@@ -133,9 +163,13 @@ func (s *Session) Handshake() error {
 	if err := s.waitConnected(HelloTimeout); err != nil {
 		return fmt.Errorf("%w: %v", ErrHandshake, err)
 	}
-	nonce := time.Now().UnixNano()
-	payload := make([]byte, 8)
-	binary.BigEndian.PutUint64(payload, uint64(nonce))
+	var payload []byte
+	if s.psk != nil {
+		payload = s.priv.PublicKey().Bytes() // 32-byte ephemeral X25519 key
+	} else {
+		payload = make([]byte, 8)
+		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
+	}
 	if err := s.SendFrame(wire.Frame{Type: wire.TypeHello, Payload: payload}); err != nil {
 		return fmt.Errorf("%w: send hello: %v", ErrHandshake, err)
 	}
@@ -177,13 +211,32 @@ func (s *Session) watchdog() {
 func (s *Session) dispatch(f wire.Frame) {
 	switch f.Type {
 	case wire.TypeHello:
-		// Acknowledge and (idempotently) complete our own handshake.
-		s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: f.Payload})
+		// In secure mode the payload is the peer's ephemeral public key:
+		// derive keys, then reply with our key BEFORE enabling crypto.
+		if s.psk != nil && s.crypto.Load() == nil {
+			c, err := deriveSession(s.psk, s.priv, f.Payload, s.isClient)
+			if err != nil {
+				s.failHello(err)
+				return
+			}
+			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: s.priv.PublicKey().Bytes()})
+			s.crypto.Store(c)
+		} else {
+			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: f.Payload})
+		}
 		select {
 		case s.helloCh <- nil:
 		default:
 		}
 	case wire.TypeHelloAck:
+		if s.psk != nil && s.crypto.Load() == nil {
+			c, err := deriveSession(s.psk, s.priv, f.Payload, s.isClient)
+			if err != nil {
+				s.failHello(err)
+				return
+			}
+			s.crypto.Store(c)
+		}
 		select {
 		case s.helloCh <- nil:
 		default:
@@ -227,7 +280,20 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	if c := s.crypto.Load(); c != nil {
+		buf, err = c.encrypt(buf)
+		if err != nil {
+			return err
+		}
+	}
 	return s.trans.Send(buf)
+}
+
+func (s *Session) failHello(err error) {
+	select {
+	case s.helloCh <- fmt.Errorf("%w: %v", ErrHandshake, err):
+	default:
+	}
 }
 
 func (s *Session) keepaliveLoop() {

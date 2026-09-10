@@ -22,7 +22,14 @@ func newMuxPair(t *testing.T) (*Mux, *Mux) {
 	if err := tb.Start(); err != nil {
 		t.Fatal(err)
 	}
-	sa, sb := session.New(ta), session.New(tb)
+	sa, err := session.New(ta, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := session.New(tb, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := sa.Start(); err != nil {
 		t.Fatal(err)
 	}
