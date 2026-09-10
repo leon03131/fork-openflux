@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -19,14 +18,24 @@ var (
 func (h *CallHandler) SetOnConnected(cb func())     { h.onConnected = cb }
 func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
 
-func (h *CallHandler) Send(data []byte) {
-	if useICEInjection {
-		h.injectICE(data)
-	} else {
-		if h.dc != nil {
-			h.dc.Send(data)
-		}
+// setConnected updates the connection state and notifies the transport.
+func (h *CallHandler) setConnected(connected bool) {
+	if h.connected.Swap(connected) != connected && h.onStateChange != nil {
+		h.onStateChange(connected)
 	}
+}
+
+func (h *CallHandler) Send(data []byte) error {
+	if useICEInjection {
+		return h.injectICE(data)
+	}
+	h.mu.Lock()
+	dc := h.dc
+	h.mu.Unlock()
+	if dc == nil {
+		return fmt.Errorf("data channel not ready")
+	}
+	return dc.Send(data)
 }
 
 func (h *CallHandler) readLoop() {
@@ -35,13 +44,14 @@ func (h *CallHandler) readLoop() {
 		_, message, err := h.conn.ReadMessage()
 		if err != nil {
 			logError("[%s] Signaling disconnected: %v", h.tag, err)
+			h.setConnected(false)
 			h.signalReconnect()
 			return
 		}
 		text := string(message)
 
 		if strings.Contains(text, "accepted-call") {
-			fmt.Println("call accepted")
+			logInfo("[%s] call accepted", h.tag)
 			h.callAccepted = true
 			continue
 		}
@@ -83,8 +93,16 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		logError("[%s] Receiver connection died, exiting", h.tag)
-		os.Exit(1)
+		// A library must never kill the process. The receiver drops
+		// the dead signaling connection and keeps waiting for new
+		// incoming calls via the MAX client event callback.
+		logError("[%s] Receiver connection died, waiting for new calls", h.tag)
+		h.mu.Lock()
+		if h.conn != nil {
+			h.conn.Close()
+			h.conn = nil
+		}
+		h.mu.Unlock()
 	}
 }
 
@@ -205,20 +223,26 @@ func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 	if h.conn == nil {
 		return
 	}
-	escaped, _ := json.Marshal(sdp)
-	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"type":"%s","sdp":%s},"animojiVersion":1},"participantType":"USER"}`,
-		h.seq, h.localID, sdpType, string(escaped))
+	if !useICEInjection {
+		// Real WebRTC path: the SDP must actually go over signaling.
+		escaped, _ := json.Marshal(sdp)
+		msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"type":"%s","sdp":%s},"animojiVersion":1},"participantType":"USER"}`,
+			h.seq, h.localID, sdpType, string(escaped))
+		if err := h.conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+			logError("[%s] SDP send failed: %v", h.tag, err)
+		}
+	}
+	// NOTE: with useICEInjection the SDP is intentionally NOT sent over
+	// signaling; data flows through injected ICE candidates instead.
 	h.seq++
 	logInfo("[%s] Sent SDP %s (%d bytes)", h.tag, sdpType, len(sdp))
-	fmt.Println(msg)
-	//h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
-func (h *CallHandler) injectICE(payload []byte) {
+func (h *CallHandler) injectICE(payload []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.conn == nil {
-		return
+		return fmt.Errorf("signaling connection not established")
 	}
 	type ice struct {
 		Candidate string `json:"candidate"`
@@ -228,7 +252,7 @@ func (h *CallHandler) injectICE(payload []byte) {
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
 		h.seq, h.localID, string(escaped))
 	h.seq++
-	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	return h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
 func (h *CallHandler) sendICE(candidateJSON string) {
@@ -443,10 +467,12 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			h.mu.Lock()
 			h.conn = conn
 			h.mu.Unlock()
+			h.setConnected(true)
 			go h.readLoop()
 
 			// Wait for disconnect signal
 			<-h.reconnectCh
+			h.setConnected(false)
 			logInfo("[CALLER] Reconnecting in 1s...")
 			time.Sleep(1 * time.Second)
 		}
@@ -520,7 +546,7 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			}
 
 			endpoint := craftEndpoint(convID, callDetails)
-			logInfo("[RECEIVER] Initial endpoint: %s", endpoint)
+			logInfo("[RECEIVER] Initial endpoint: %s", redactEndpointToken(endpoint))
 
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
 			if err != nil {
@@ -530,6 +556,7 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			h.mu.Lock()
 			h.conn = conn
 			h.mu.Unlock()
+			h.setConnected(true)
 			go h.readLoop()
 			go func() {
 				time.Sleep(1 * time.Second)

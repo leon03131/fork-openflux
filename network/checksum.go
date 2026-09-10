@@ -54,19 +54,27 @@ func ParsePacketInfo(data []byte) string {
 	if len(data) < 20 {
 		return fmt.Sprintf("short packet (%d bytes)", len(data))
 	}
+	ihl := int(data[0]&0x0F) * 4
+	if ihl < 20 {
+		return fmt.Sprintf("malformed IPv4 header (ihl=%d)", ihl)
+	}
 	srcIP := net.IP(data[12:16])
 	dstIP := net.IP(data[16:20])
 	protocol := data[9]
 	ttl := data[8]
 	totalLen := uint16(data[2])<<8 | uint16(data[3])
 
-	if protocol == 6 && len(data) >= 40 {
-		srcPort := uint16(data[20])<<8 | uint16(data[21])
-		dstPort := uint16(data[22])<<8 | uint16(data[23])
-		flags := data[33]
-		seq := uint32(data[24])<<24 | uint32(data[25])<<16 | uint32(data[26])<<8 | uint32(data[27])
-		ack := uint32(data[28])<<24 | uint32(data[29])<<16 | uint32(data[30])<<8 | uint32(data[31])
-		window := uint16(data[34])<<8 | uint16(data[35])
+	if protocol == 6 {
+		if len(data) < ihl+20 {
+			return fmt.Sprintf("truncated TCP header (%d bytes, ihl=%d)", len(data), ihl)
+		}
+		tcp := data[ihl:]
+		srcPort := uint16(tcp[0])<<8 | uint16(tcp[1])
+		dstPort := uint16(tcp[2])<<8 | uint16(tcp[3])
+		flags := tcp[13]
+		seq := uint32(tcp[4])<<24 | uint32(tcp[5])<<16 | uint32(tcp[6])<<8 | uint32(tcp[7])
+		ack := uint32(tcp[8])<<24 | uint32(tcp[9])<<16 | uint32(tcp[10])<<8 | uint32(tcp[11])
+		window := uint16(tcp[14])<<8 | uint16(tcp[15])
 
 		flagStr := ""
 		if flags&0x02 != 0 {

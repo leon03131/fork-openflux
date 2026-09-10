@@ -1,6 +1,8 @@
 package oneme
 
 import (
+	"fmt"
+
 	"github.com/leon03131/fork-openflux/transport"
 	"github.com/leon03131/fork-openflux/utils"
 )
@@ -11,7 +13,7 @@ type OneMeTransport struct {
 	uid   int64
 	exit  bool
 
-	oneMeClient MaxClient
+	oneMeClient *MaxClient
 	ch          *CallHandler
 }
 
@@ -34,20 +36,29 @@ func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transp
 
 func (t *OneMeTransport) Start() error {
 	utils.Debugf("creating max client ...")
-	t.oneMeClient = *NewMaxClient()
-	t.oneMeClient.Connect()
-	t.oneMeClient.LoginByToken(t.token)
+	t.oneMeClient = NewMaxClient()
+	if err := t.oneMeClient.Connect(); err != nil {
+		return fmt.Errorf("max connect: %w", err)
+	}
+	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
+		return fmt.Errorf("max login: %w", err)
+	}
 
 	if t.exit {
 		utils.Debugf("configured ch for exit node")
-		t.ch = startIncomingListener(&t.oneMeClient)
+		t.ch = startIncomingListener(t.oneMeClient)
 	} else {
 		utils.Debugf("configured ch for client mode")
-		t.ch = startOutgoingCall(&t.oneMeClient, t.uid)
+		t.ch = startOutgoingCall(t.oneMeClient, t.uid)
+	}
+
+	t.ch.onStateChange = func(connected bool) {
+		t.b.SetConnected(connected)
 	}
 
 	utils.Debugf("configured dc inbound")
 	t.ch.dcInbound = func(data []byte) {
+		t.b.RecordReceive(len(data))
 		t.b.CallReceive(data)
 	}
 
@@ -59,10 +70,19 @@ func (t *OneMeTransport) Stop() error {
 }
 
 func (t *OneMeTransport) IsConnected() bool {
-	return true
+	return t.b.IsConnected()
 }
 
 func (t *OneMeTransport) Send(data []byte) error {
-	t.ch.Send(data)
+	if !t.b.IsConnected() {
+		return fmt.Errorf("transport not connected")
+	}
+	if t.ch == nil {
+		return fmt.Errorf("call handler not initialized")
+	}
+	if err := t.ch.Send(data); err != nil {
+		return err
+	}
+	t.b.RecordSend(len(data))
 	return nil
 }

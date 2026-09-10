@@ -7,13 +7,14 @@ import (
 	"os"
 	"strconv"
 
+	_ "github.com/wlynxg/anet"
+
 	"github.com/leon03131/fork-openflux/socks5"
 	"github.com/leon03131/fork-openflux/transport"
 	"github.com/leon03131/fork-openflux/transport/oneme"
 	"github.com/leon03131/fork-openflux/transport/yandex"
 	"github.com/leon03131/fork-openflux/tunnel"
 	"github.com/leon03131/fork-openflux/utils"
-	_ "github.com/wlynxg/anet"
 )
 
 var (
@@ -23,20 +24,20 @@ var (
 )
 
 func main() {
-	//os.Setenv("GODEBUG", "netdns=go")
 	fmt.Print("written by p1neappleXpress\n")
 
 	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
-	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
-	flag.StringVar(&maxToken, "maxToken", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&maxUid, "maxUid", "", "MAX Web token. If u use MAX transport")
+	socksAddr := flag.String("socks5", "127.0.0.1:1080", "SOCKS5 listen address")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, oneme)")
+	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL (Yandex Docs transport)")
+	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token (oneme transport)")
+	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	flag.Parse()
 
-	if !*exitNode && !*client {
+	if *exitNode == *client {
+		// Either exactly one mode is set, or none.
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -45,7 +46,7 @@ func main() {
 		utils.EnableDebug()
 	}
 
-	log.Printf("=== Universal Bypass Tool ===")
+	log.Printf("=== OpenFlux ===")
 	log.Printf("Mode: %s", map[bool]string{true: "EXIT NODE", false: "CLIENT"}[*exitNode])
 	log.Printf("Transport: %s", *transportType)
 
@@ -56,7 +57,10 @@ func main() {
 	case "yandex":
 		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(globalDocUrl, config))
 	case "oneme":
-		uidint, _ := strconv.ParseInt(maxUid, 10, 64)
+		uidint, err := strconv.ParseInt(maxUid, 10, 64)
+		if err != nil {
+			log.Fatalf("Invalid --maxUid %q: %v", maxUid, err)
+		}
 		trans = transport.NewCompressedTransport(oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config))
 	default:
 		log.Fatalf("Unknown transport type: %s", *transportType)
@@ -66,7 +70,10 @@ func main() {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
 
-	tun := tunnel.NewTCPTunnel(trans, *exitNode)
+	tun, err := tunnel.NewTCPTunnel(trans, *exitNode)
+	if err != nil {
+		log.Fatalf("Failed to init tunnel: %v", err)
+	}
 
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (needs root for raw socket)")

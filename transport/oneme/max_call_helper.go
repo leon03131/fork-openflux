@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
 	"github.com/pierrec/lz4/v4"
 )
@@ -42,4 +43,18 @@ func craftEndpoint(convID, jsonConfig string) string {
 	}
 	return fmt.Sprintf("%s/ws2?userId=%s&entityType=USER&deviceIdx=0&conversationId=%s&token=%s&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=accept",
 		baseURL, userID, convID, config.Token)
+}
+
+// redactEndpointToken masks the token query parameter for logging.
+func redactEndpointToken(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "(unparseable endpoint)"
+	}
+	q := u.Query()
+	if q.Has("token") {
+		q.Set("token", "***")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }

@@ -44,6 +44,7 @@ func (c *MaxClient) readLoop() {
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
+			logError("[MAX] connection lost: %v", err)
 			return
 		}
 		var packet MaxPacket
@@ -102,49 +103,8 @@ func (c *MaxClient) LoginByToken(token string) error {
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	users := c.getUserMap(resp)
-	fmt.Println("\n=== CONTACTS ===")
-	for id, u := range users {
-		fmt.Printf("  ID: %d | %s %s | Phone: %d\n", id, u.FirstName, u.LastName, u.Phone)
-	}
-	fmt.Println()
+	logInfo("[MAX] logged in")
 	return nil
-}
-
-func (c *MaxClient) getUserMap(resp *MaxPacket) map[int64]UserInfo {
-	userMap := make(map[int64]UserInfo)
-	var payload map[string]interface{}
-	if json.Unmarshal(resp.Payload, &payload) != nil {
-		return userMap
-	}
-	if contacts, ok := payload["contacts"].([]interface{}); ok {
-		for _, contact := range contacts {
-			cm := contact.(map[string]interface{})
-			id := int64(cm["id"].(float64))
-			u := UserInfo{ID: id}
-			if phone, ok := cm["phone"].(float64); ok {
-				u.Phone = int64(phone)
-			}
-			if names, ok := cm["names"].([]interface{}); ok {
-				for _, name := range names {
-					n := name.(map[string]interface{})
-					if n["type"] == "ONEME" {
-						if v, ok := n["firstName"].(string); ok {
-							u.FirstName = v
-						}
-						if v, ok := n["lastName"].(string); ok {
-							u.LastName = v
-						}
-						if v, ok := n["name"].(string); ok {
-							u.FullName = v
-						}
-					}
-				}
-			}
-			userMap[id] = u
-		}
-	}
-	return userMap
 }
 
 func (c *MaxClient) keepalive() {

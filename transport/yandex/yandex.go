@@ -189,12 +189,12 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 func (t *YandexDocsTransport) writerLoop() {
 	for t.IsRunning() {
-		t.Mu.Lock()
+		t.Mu.RLock()
 		session := t.session
-		t.Mu.Unlock()
+		t.Mu.RUnlock()
 
 		if session == nil || session.Conn == nil {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
@@ -206,8 +206,8 @@ func (t *YandexDocsTransport) writerLoop() {
 			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 				utils.Debugf("[YDOCS] Write error: %v", err)
 			}
-		default:
-			time.Sleep(10 * time.Millisecond)
+		case <-time.After(250 * time.Millisecond):
+			// Periodic wake-up to re-check IsRunning and session.
 		}
 	}
 }
@@ -289,14 +289,55 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 	return ""
 }
 
+// maxReconnectDelay caps the exponential reconnect backoff.
+const maxReconnectDelay = 30 * time.Second
+
 func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	if !t.IsRunning() || attempt >= t.GetConfig().MaxReconnectAttempts {
 		return
 	}
 
 	t.RecordReconnect()
-	t.connectToDoc(attempt + 1)
+
+	cfg := t.GetConfig()
+	delay := cfg.ReconnectDelay
+	for i := 0; i < attempt; i++ {
+		delay = time.Duration(float64(delay) * cfg.ReconnectMultiplier)
+		if delay >= maxReconnectDelay {
+			delay = maxReconnectDelay
+			break
+		}
+	}
+
+	utils.Debugf("[YDOCS] Reconnect #%d in %v", attempt+1, delay)
+	time.AfterFunc(delay, func() {
+		t.connectToDoc(attempt + 1)
+	})
 }
+
+// clientConfigDoc is the typed subset of the Yandex Docs "client-config"
+// JSON that this transport depends on. Any provider schema change results
+// in a validation error instead of a panic.
+type clientConfigDoc struct {
+	OfficeActionData struct {
+		BalancerURL  string `json:"balancer_url"`
+		EditorConfig *struct {
+			Token    string `json:"token"`
+			Document struct {
+				Key         string                 `json:"key"`
+				URL         string                 `json:"url"`
+				Title       string                 `json:"title"`
+				FileType    string                 `json:"fileType"`
+				Permissions map[string]interface{} `json:"permissions"`
+			} `json:"document"`
+		} `json:"editor_config"`
+	} `json:"officeActionData"`
+}
+
+// maxConfigPageSize bounds the HTML page we parse (defense in depth).
+const maxConfigPageSize = 8 << 20 // 8 MiB
+
+var clientConfigRe = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
 	client := &http.Client{
@@ -304,7 +345,10 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		Timeout:       30 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("bad document URL: %w", err)
+	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -312,7 +356,14 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 	defer resp.Body.Close()
 
-	htmlBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return YandexDocsInfo{}, fmt.Errorf("document page returned HTTP %d", resp.StatusCode)
+	}
+
+	htmlBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxConfigPageSize))
+	if err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("read document page: %w", err)
+	}
 	html := string(htmlBytes)
 
 	var cookies []string
@@ -320,45 +371,48 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
-	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
-	matches := re.FindStringSubmatch(html)
+	matches := clientConfigRe.FindStringSubmatch(html)
 	if len(matches) < 2 {
-		return YandexDocsInfo{}, fmt.Errorf("config not found")
+		return YandexDocsInfo{}, fmt.Errorf("client-config script not found (provider schema changed?)")
 	}
 
-	var config map[string]interface{}
-	json.Unmarshal([]byte(matches[1]), &config)
-	officeAction := config["officeActionData"].(map[string]interface{})
-
-	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
-	if !ok || editorConfigRaw == nil {
-		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
+	var config clientConfigDoc
+	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("client-config JSON: %w", err)
 	}
 
-	balancerURL := officeAction["balancer_url"].(string)
+	ec := config.OfficeActionData.EditorConfig
+	if ec == nil {
+		return YandexDocsInfo{}, fmt.Errorf("editor_config missing (legacy editor not enabled?)")
+	}
+	if ec.Token == "" || ec.Document.Key == "" || config.OfficeActionData.BalancerURL == "" {
+		return YandexDocsInfo{}, fmt.Errorf("client-config missing required fields (provider schema changed?)")
+	}
+
+	balancerURL := config.OfficeActionData.BalancerURL
 	host := strings.TrimPrefix(balancerURL, "https://")
-	document := editorConfigRaw["document"].(map[string]interface{})
+	document := ec.Document
 
-	perms, _ := document["permissions"].(map[string]interface{})
+	perms := document.Permissions
 	if perms == nil {
 		perms = make(map[string]interface{})
 	}
 
 	return YandexDocsInfo{
 		CookieStr:   strings.Join(cookies, "; "),
-		Token:       editorConfigRaw["token"].(string),
-		DocID:       document["key"].(string),
+		Token:       ec.Token,
+		DocID:       document.Key,
 		Origin:      balancerURL,
 		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document["key"].(string)),
+		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document.Key),
 		Permissions: perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
-			"id":     document["key"].(string),
+			"id":     document.Key,
 			"userid": userID,
-			"format": document["fileType"],
-			"url":    document["url"],
-			"title":  document["title"],
+			"format": document.FileType,
+			"url":    document.URL,
+			"title":  document.Title,
 			"lcid":   25,
 		},
 	}, nil

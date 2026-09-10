@@ -27,7 +27,7 @@ type TCPTunnel struct {
 	packetCount atomic.Uint64
 }
 
-func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
+func NewTCPTunnel(trans transport.Transport, isExitNode bool) (*TCPTunnel, error) {
 	t := &TCPTunnel{
 		transport:  trans,
 		isExitNode: isExitNode,
@@ -42,28 +42,32 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 
 	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
 		&tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-		utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
+		return nil, fmt.Errorf("set TCP recv buffer: %v", err)
 	}
 	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
 		&tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-		utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
+		return nil, fmt.Errorf("set TCP send buffer: %v", err)
 	}
 
 	tunnelEP := NewTunnelLinkEndpoint()
-	tunnelEP.onOutgoingPacket = func(data []byte) {
-		trans.Send(data)
+	tunnelEP.onOutgoingPacket = func(data []byte) error {
+		return trans.Send(data)
 	}
 	t.tunnelEP = tunnelEP
 
 	tunnelNIC := tcpip.NICID(1)
 	if err := t.gvisorStack.CreateNIC(tunnelNIC, tunnelEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC tunnel error: %v", err)
+		return nil, fmt.Errorf("create tunnel NIC: %v", err)
 	}
 
+	var err error
 	if isExitNode {
-		t.setupExitNode(tunnelNIC)
+		err = t.setupExitNode(tunnelNIC)
 	} else {
-		t.setupClient(tunnelNIC)
+		err = t.setupClient(tunnelNIC)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	trans.Receive(func(data []byte) {
@@ -71,42 +75,46 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 	})
 
 	go t.printStats()
-	return t
+	return t, nil
 }
 
-func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
-	localIP := getLocalIP()
-	utils.Debugf("[TUNNEL] EXIT NODE - Local IP: %s", localIP)
-
-	rawEP, err := NewRawSocketEndpoint(tcpip.NICID(2))
+func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) error {
+	localIP, err := detectLocalIP()
 	if err != nil {
-		utils.Debugf("[TUNNEL] Raw socket error: %v", err)
-		return
+		return err
+	}
+	utils.Debugf("[TUNNEL] EXIT NODE - Local IP: %s", net.IP(localIP[:]))
+
+	rawEP, err := NewRawSocketEndpoint(tcpip.NICID(2), localIP)
+	if err != nil {
+		return fmt.Errorf("raw socket: %w", err)
 	}
 
 	t.rawEP = rawEP
 	rawEP.SetTransportSender(func(data []byte) {
-		t.transport.Send(data)
+		if err := t.transport.Send(data); err != nil {
+			utils.Debugf("[TUNNEL] transport send failed: %v", err)
+		}
 	})
 
 	internetNIC := tcpip.NICID(2)
 	if err := t.gvisorStack.CreateNIC(internetNIC, rawEP); err != nil {
-		utils.Debugf("[TUNNEL] CreateNIC internet error: %v", err)
-		return
+		return fmt.Errorf("create internet NIC: %v", err)
 	}
 
-	var ipBytes [4]byte
-	fmt.Sscanf(localIP, "%d.%d.%d.%d", &ipBytes[0], &ipBytes[1], &ipBytes[2], &ipBytes[3])
-	internetAddr := tcpip.AddrFrom4(ipBytes)
-	t.gvisorStack.AddProtocolAddress(internetNIC, tcpip.ProtocolAddress{
+	if err := t.gvisorStack.AddProtocolAddress(internetNIC, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   internetAddr,
+			Address:   tcpip.AddrFrom4(localIP),
 			PrefixLen: 24,
 		},
-	}, stack.AddressProperties{})
+	}, stack.AddressProperties{}); err != nil {
+		return fmt.Errorf("add internet NIC address: %v", err)
+	}
 
-	t.gvisorStack.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
+	if err := t.gvisorStack.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true); err != nil {
+		return fmt.Errorf("enable forwarding: %v", err)
+	}
 	t.gvisorStack.AddRoute(tcpip.Route{
 		Destination: header.IPv4EmptySubnet,
 		NIC:         internetNIC,
@@ -120,22 +128,25 @@ func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
 		Destination: tunnelSubnet,
 		NIC:         tunnelNIC,
 	})
+	return nil
 }
 
-func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
-	clientAddr := tcpip.AddrFrom4([4]byte{10, 10, 10, 2})
-	t.gvisorStack.AddProtocolAddress(tunnelNIC, tcpip.ProtocolAddress{
+func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) error {
+	if err := t.gvisorStack.AddProtocolAddress(tunnelNIC, tcpip.ProtocolAddress{
 		Protocol: ipv4.ProtocolNumber,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   clientAddr,
+			Address:   tcpip.AddrFrom4(tunnelClientIP),
 			PrefixLen: 24,
 		},
-	}, stack.AddressProperties{})
+	}, stack.AddressProperties{}); err != nil {
+		return fmt.Errorf("add tunnel NIC address: %v", err)
+	}
 
 	t.gvisorStack.AddRoute(tcpip.Route{
 		Destination: header.IPv4EmptySubnet,
 		NIC:         tunnelNIC,
 	})
+	return nil
 }
 
 func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
@@ -184,14 +195,4 @@ func (t *TCPTunnel) printStats() {
 			stats.TCP.Retransmits.Value(),
 		)
 	}
-}
-
-func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "192.168.1.100"
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
 }
