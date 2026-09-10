@@ -36,18 +36,18 @@ const (
 
 // Frame types.
 const (
-	TypeHello         byte = 0x01 // handshake (payload: Hello)
-	TypeHelloAck      byte = 0x02 // handshake response (payload: HelloAck)
-	TypeOpen          byte = 0x03 // open stream (payload: encoded address)
-	TypeOpenOK        byte = 0x04 // stream opened
-	TypeOpenError     byte = 0x05 // payload: error string
-	TypeData          byte = 0x06 // stream payload
-	TypeWindowUpdate  byte = 0x07 // payload: uint32 credit
-	TypeHalfClose     byte = 0x08 // sender will not write anymore
-	TypeClose         byte = 0x09 // stream closed/reset
-	TypePing          byte = 0x0A // payload: uint64 timestamp (ns)
-	TypePong          byte = 0x0B // payload: echoed uint64
-	TypeGoAway        byte = 0x0C // session teardown
+	TypeHello        byte = 0x01 // handshake (payload: Hello)
+	TypeHelloAck     byte = 0x02 // handshake response (payload: HelloAck)
+	TypeOpen         byte = 0x03 // open stream (payload: encoded address)
+	TypeOpenOK       byte = 0x04 // stream opened
+	TypeOpenError    byte = 0x05 // payload: error string
+	TypeData         byte = 0x06 // stream payload
+	TypeWindowUpdate byte = 0x07 // payload: uint32 credit
+	TypeHalfClose    byte = 0x08 // sender will not write anymore
+	TypeClose        byte = 0x09 // stream closed/reset
+	TypePing         byte = 0x0A // payload: uint64 timestamp (ns)
+	TypePong         byte = 0x0B // payload: echoed uint64
+	TypeGoAway       byte = 0x0C // session teardown
 )
 
 var (

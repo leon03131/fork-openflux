@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+func waitConnected(t *testing.T, tr Transport) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !tr.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("transport did not become connected in 5s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // RunConformance exercises the Transport contract against any
 // implementation pair. It is used by MemoryTransport tests and can be
 // reused by future carriers.
@@ -19,9 +30,9 @@ func RunConformance(t *testing.T, a, b Transport) {
 		t.Fatalf("start b: %v", err)
 	}
 
-	if !a.IsConnected() || !b.IsConnected() {
-		t.Fatal("expected both endpoints connected after Start")
-	}
+	// Some carriers connect asynchronously (direct dials with retries).
+	waitConnected(t, a)
+	waitConnected(t, b)
 
 	recvA := make(chan []byte, 16)
 	recvB := make(chan []byte, 16)
