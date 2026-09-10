@@ -107,6 +107,8 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 	select {
 	case resp := <-ch:
 		return &resp, nil
+	case <-c.closedCh:
+		return nil, fmt.Errorf("client closed")
 	case <-time.After(30 * time.Second):
 		return nil, fmt.Errorf("timeout")
 	}
@@ -175,6 +177,13 @@ func (c *MaxClient) Supervise(token string) {
 			continue
 		}
 		if err := c.LoginByToken(token); err != nil {
+			// invoke aborts immediately once closedCh is closed, so a
+			// login error during shutdown must not trigger a retry.
+			select {
+			case <-c.closedCh:
+				return
+			default:
+			}
 			logError("[MAX] re-login failed: %v", err)
 			c.dead.Store(true)
 			continue
@@ -214,11 +223,11 @@ func Check(token string) error {
 func (c *MaxClient) keepalive() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		select {
 		case <-c.keepaliveStop:
 			return
-		default:
+		case <-ticker.C:
 			if c.loggedIn.Load() {
 				c.invoke(1, map[string]interface{}{"interactive": false})
 			}

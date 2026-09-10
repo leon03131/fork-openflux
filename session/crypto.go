@@ -24,10 +24,12 @@ import (
 //	PSK mixed into HKDF  ->  mutual authentication (both ends must know it)
 //	ChaCha20-Poly1305    ->  AEAD for every frame after the handshake
 //
-// Wire format of an encrypted carrier message: [12-byte random nonce]
-// [ciphertext]. Explicit random nonces make the scheme robust against
-// carriers that occasionally drop a message (a dropped message would
-// desync a counter-based nonce forever).
+// Wire format of an encrypted carrier message: [8-byte sequence]
+// [ciphertext]. The AEAD nonce is deterministically derived from the
+// sequence (00000000 || seq, RFC 8439 counter mode, same as Noise
+// CipherState): unique per message under the session key, no randomness
+// needed. Carriers are reliable+ordered by contract; a dropped or
+// reordered message is a contract violation and kills the session.
 
 const (
 	nonceSize = chacha20poly1305.NonceSize
