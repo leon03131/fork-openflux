@@ -473,3 +473,11 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 func randUserID() string {
 	return fmt.Sprintf("%010d", rand.New(rand.NewSource(time.Now().UnixNano())).Intn(1000000000))
 }
+
+// CheckDoc verifies that the document URL is reachable and has a
+// compatible client-config (used by `openflux doctor`).
+func CheckDoc(url string) error {
+	t := NewYandexDocsTransport(url, transport.DefaultConfig())
+	_, err := t.fetchDocInfo(url, "doctor000")
+	return err
+}

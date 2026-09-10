@@ -26,19 +26,21 @@ Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to 
 ## Structure
 
 ```
-├── main.go
+├── main.go                 # CLI (client/exit/doctor/version), supervisor
+├── wire/                   # Wire protocol v2 (binary framing)
+├── session/                # Handshake (X25519+PSK), AEAD, keepalive
+├── mux/                    # Stream multiplexer (net.Conn), flow control
+├── exit/                   # v2 exit node (plain net.Dial, no root)
 ├── transport/
-│   ├── transport.go        # Transport interface
-│   ├── compressor.go       # LZ4 compression wrapper
-│   ├── yandex/             # Yandex Docs backend
-│   └── oneme/              # MAX Messenger backend
-├── tunnel/
-│   ├── tunnel.go           # TCP tunnel core
-│   ├── endpoint.go         # Virtual NIC
-│   ├── rawsocket_common.go # Raw socket shared logic (exit node)
-│   └── rawsocket_{linux,windows,darwin}.go  # Platform socket code
+│   ├── transport.go        # Carrier interface
+│   ├── memory.go           # In-process test carrier
+│   ├── direct.go           # Reference TCP carrier
+│   ├── compressor.go       # LZ4 wrapper (legacy mode)
+│   ├── yandex/             # Yandex Docs carrier
+│   └── oneme/              # MAX Messenger carrier
+├── tunnel/                 # legacy gVisor packet tunnel
 ├── socks5/                 # SOCKS5 server
-├── network/                # Checksums, packet parsing
+├── network/                # Checksums, packet parsing (legacy)
 └── utils/                  # Debug logging
 ```
 
@@ -63,37 +65,70 @@ export XCODE_PATH="<your Xcode.app path>" # optional, defaults to /Applications/
 
 ## Usage
 
-### 1. Setting up exit node
-1. You must have root access on exit node machine;
-2. Only legacy Yandex document editor is supported (you can toggle this setting from the interface).
+OpenFlux has two protocol modes:
 
-Setup commands for exit node:
+- **v2 (default)** — stream multiplexer over an encrypted session. The exit
+  node needs **no root** and no iptables rules; DNS is resolved on the exit
+  side; IPv4/IPv6 supported.
+- **legacy** (`--mode legacy`) — the original gVisor packet tunnel with raw
+  sockets (exit node needs root).
+
+### v2 quickstart (recommended)
+
+Exit node (any Linux box, no root):
+```bash
+export OPENFLUX_PSK="your-long-random-shared-secret"
+./openflux exit --transport yandex --url "YOUR_YANDEX_DOC_URL"
+```
+
+Client:
+```bash
+export OPENFLUX_PSK="your-long-random-shared-secret"
+./openflux client --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
+```
+
+Then point your browser's SOCKS5 proxy at `127.0.0.1:1080` (enable
+"proxy DNS" / use SOCKS5h so domains resolve on the exit side).
+
+For local testing without third-party services there is a reference
+`direct` carrier (plain TCP):
+
+```bash
+./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk secret
+./openflux client --transport direct --addr EXIT_IP:9000 --psk secret
+```
+
+Diagnostics: `./openflux doctor --transport ... ` checks config and
+connectivity. `./openflux version` prints the build version.
+
+### legacy mode (exit node)
+
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
-sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
+sudo ./openflux exit --mode legacy --transport yandex --url "YOUR_YANDEX_DOC_URL"
 ```
 
-### 2. Setting up desktop client:
+### legacy mode (client)
 
-Setup commands for desktop client:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080 --debug
+./openflux client --mode legacy --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
 ```
-
-Then set up SOCKS5 proxy in your browser at localhost:1080.
 
 ## Flags
 
 | Flag          | Default             | Description                |
 |---------------|---------------------|----------------------------|
-| `--client`    |                     | Run as client                     |
-| `--exit-node` |                     | Run as exit node                  |
-| `--socks5`    | `127.0.0.1:1080`    | SOCKS5 listen address             |
-| `--url`       |                     | Document URL (Yandex Docs)        |
-| `--maxToken`  | ``                  | MAX Web token (oneme transport)   |
-| `--maxUid`    | ``                  | MAX call user id (oneme transport)|
-| `--debug`     | `false`             | Enable verbose logging            |
-| `--transport` | `yandex`            | Transport type (yandex, oneme)    |
+| `--client`    |                     | Run as client (or `client` subcommand)  |
+| `--exit-node` |                     | Run as exit node (or `exit` subcommand) |
+| `--mode`      | `v2`                | Protocol mode (v2, legacy)              |
+| `--psk`       | env `OPENFLUX_PSK`  | Pre-shared key (v2 encryption)          |
+| `--socks5`    | `127.0.0.1:1080`    | SOCKS5 listen address                   |
+| `--url`       |                     | Document URL (yandex transport)         |
+| `--maxToken`  | ``                  | MAX Web token (oneme transport)         |
+| `--maxUid`    | ``                  | MAX call user id (oneme transport)      |
+| `--addr`      | ``                  | Address (direct transport)              |
+| `--debug`     | `false`             | Enable verbose logging                  |
+| `--transport` | `yandex`            | Transport type (yandex, oneme, direct)  |
 
 ## Implementing custom transports
 

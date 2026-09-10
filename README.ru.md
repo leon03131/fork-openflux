@@ -26,19 +26,21 @@ TCP-пакеты передаются через Transport. На данный м
 ## Структура
 
 ```
-├── main.go
+├── main.go                 # CLI (client/exit/doctor/version), супервизор
+├── wire/                   # Wire-протокол v2 (бинарный фрейминг)
+├── session/                # Рукопожатие (X25519+PSK), AEAD, keepalive
+├── mux/                    # Потоковый мультиплексор (net.Conn), flow control
+├── exit/                   # v2 выходная нода (net.Dial, root не нужен)
 ├── transport/
-│   ├── transport.go        # Интерфейс Transport
-│   ├── compressor.go       # LZ4-сжатие
-│   ├── yandex/             # Yandex Docs бэкенд
-│   └── oneme/              # MAX Messenger бэкенд
-├── tunnel/
-│   ├── tunnel.go           # Ядро TCP-туннеля
-│   ├── endpoint.go         # Виртуальный NIC
-│   ├── rawsocket_common.go # Общая логика raw-сокета (нода)
-│   └── rawsocket_{linux,windows,darwin}.go  # Платформенный код сокетов
+│   ├── transport.go        # Интерфейс Carrier
+│   ├── memory.go           # In-process тестовый carrier
+│   ├── direct.go           # Эталонный TCP carrier
+│   ├── compressor.go       # LZ4-обёртка (legacy-режим)
+│   ├── yandex/             # Yandex Docs carrier
+│   └── oneme/              # MAX Messenger carrier
+├── tunnel/                 # legacy gVisor packet-туннель
 ├── socks5/                 # SOCKS5-сервер
-├── network/                # Чексуммы, парсинг пакетов
+├── network/                # Чексуммы, парсинг пакетов (legacy)
 └── utils/                  # Отладочное логирование
 ```
 
@@ -63,37 +65,70 @@ export XCODE_PATH="<путь до вашего Xcode.app>" # опциональ�
 
 ## Использование
 
-### 1. Настройка выходной ноды
-1. У вас должен быть root-доступ выходной ноде;
-2. Поддерживается только устаревший редактор документов Yandex (переключается в настройках интерфейса).
+У OpenFlux два режима протокола:
 
-Команды для настройки выходной ноды:
+- **v2 (по умолчанию)** — потоковый мультиплексор поверх зашифрованной
+  сессии. Выходной ноде **не нужен root** и правила iptables; DNS
+  резолвится на стороне ноды; поддерживаются IPv4/IPv6.
+- **legacy** (`--mode legacy`) — исходный gVisor packet-туннель с
+  raw-сокетами (ноде нужен root).
+
+### Быстрый старт v2 (рекомендуется)
+
+Выходная нода (любой Linux, без root):
+```bash
+export OPENFLUX_PSK="your-long-random-shared-secret"
+./openflux exit --transport yandex --url "YOUR_YANDEX_DOC_URL"
+```
+
+Клиент:
+```bash
+export OPENFLUX_PSK="your-long-random-shared-secret"
+./openflux client --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
+```
+
+Затем настройте SOCKS5-прокси в браузере на `127.0.0.1:1080` (включите
+«проксировать DNS» / SOCKS5h, чтобы домены резолвились на стороне ноды).
+
+Для локального тестирования без сторонних сервисов есть эталонный
+carrier `direct` (чистый TCP):
+
+```bash
+./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk secret
+./openflux client --transport direct --addr EXIT_IP:9000 --psk secret
+```
+
+Диагностика: `./openflux doctor --transport ...` — проверка конфигурации
+и связности. `./openflux version` — версия сборки.
+
+### legacy-режим (выходная нода)
+
 ```bash
 sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
-sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
+sudo ./openflux exit --mode legacy --transport yandex --url "YOUR_YANDEX_DOC_URL"
 ```
 
-### 2. Настройка десктопного клиента:
+### legacy-режим (клиент)
 
-Команды для настройки десктопного клиента:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080 --debug
+./openflux client --mode legacy --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
 ```
-
-Затем настройте SOCKS5-прокси в браузере на localhost:1080.
 
 ## Флаги
 
-| Флаг          | По умолчанию        | Описание                            |
-|---------------|---------------------|-------------------------------------|
-| `--client`    |                     | Запуск в режиме клиента             |
-| `--exit-node` |                     | Запуск в режиме ноды                |
-| `--socks5`    | `127.0.0.1:1080`    | Адрес SOCKS5 прокси                 |
-| `--url`       |                     | URL документа (Yandex Docs)         |
-| `--maxToken`  | ``                  | MAX Web токен (транспорт oneme)     |
-| `--maxUid`    | ``                  | ID пользователя для звонка (oneme)  |
-| `--debug`     | `false`             | Включить подробное логирование      |
-| `--transport` | `yandex`            | Тип транспорта (yandex, oneme)      |
+| Флаг          | По умолчанию        | Описание                                |
+|---------------|---------------------|-----------------------------------------|
+| `--client`    |                     | Режим клиента (или сабкоманда `client`) |
+| `--exit-node` |                     | Режим ноды (или сабкоманда `exit`)      |
+| `--mode`      | `v2`                | Режим протокола (v2, legacy)            |
+| `--psk`       | env `OPENFLUX_PSK`  | Общий секрет (шифрование v2)            |
+| `--socks5`    | `127.0.0.1:1080`    | Адрес SOCKS5 прокси                     |
+| `--url`       |                     | URL документа (транспорт yandex)        |
+| `--maxToken`  | ``                  | MAX Web токен (транспорт oneme)         |
+| `--maxUid`    | ``                  | ID пользователя для звонка (oneme)      |
+| `--addr`      | ``                  | Адрес (транспорт direct)                |
+| `--debug`     | `false`             | Включить подробное логирование          |
+| `--transport` | `yandex`            | Тип транспорта (yandex, oneme, direct)  |
 
 ## Реализация собственных транспортов
 

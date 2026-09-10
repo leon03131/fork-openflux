@@ -109,6 +109,19 @@ func (c *MaxClient) LoginByToken(token string) error {
 	return nil
 }
 
+// Check verifies MAX connectivity and credentials (used by
+// `openflux doctor`).
+func Check(token string) error {
+	c := NewMaxClient()
+	if err := c.Connect(); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	if err := c.LoginByToken(token); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	return nil
+}
+
 func (c *MaxClient) keepalive() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
