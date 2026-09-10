@@ -292,6 +292,54 @@ func TestDeadlineWakesBlockedRead(t *testing.T) {
 	}
 }
 
+func TestSetReadDeadlineWakesAllReaders(t *testing.T) {
+	cm, sm := newMuxPair(t)
+	go func() {
+		for {
+			st, err := sm.Accept()
+			if err != nil {
+				return
+			}
+			st.AcceptOpen() // never sends
+		}
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	// net.Conn allows concurrent Reads from multiple goroutines; one
+	// SetReadDeadline must wake ALL of them.
+	const readers = 3
+	var wg sync.WaitGroup
+	wg.Add(readers)
+	errs := make([]error, readers)
+	for i := 0; i < readers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = st.Read(make([]byte, 1))
+		}(i)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	st.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		for i := range errs {
+			if !errors.Is(errs[i], os.ErrDeadlineExceeded) {
+				t.Fatalf("reader %d: %v", i, errs[i])
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("not all readers woke up")
+	}
+}
+
 func TestSetDeadlineWakesBothDirections(t *testing.T) {
 	cm, sm := newMuxPair(t)
 

@@ -176,24 +176,30 @@ func (c *sessionCrypto) encrypt(plaintext []byte) ([]byte, error) {
 	return out, nil
 }
 
-// decrypt unwraps [8-byte seq][ciphertext], verifies integrity and
-// enforces strict in-order delivery: replays and gaps (a lost frame)
-// are fatal errors, because a reliable ordered carrier must not
-// exhibit either.
+// decrypt unwraps [8-byte seq][ciphertext], verifies integrity FIRST,
+// and only then enforces strict in-order delivery. Order matters:
+// consuming the sequence before AEAD verification would let a corrupted
+// frame burn its seq number and leave a silent hole in the stream while
+// the session survives.
 func (c *sessionCrypto) decrypt(data []byte) ([]byte, error) {
 	if len(data) < 8+chacha20poly1305.Overhead {
 		return nil, errors.New("session: ciphertext too short")
 	}
 	seq := binary.BigEndian.Uint64(data[:8])
-	// Ordering first: cheaply rejects replays/gaps before AEAD work.
+	nonce := seqNonce(seq)
+	plain, err := c.recv.Open(nil, nonce[:], data[8:], nil)
+	if err != nil {
+		// Corruption/forgery: sequence NOT consumed.
+		return nil, err
+	}
+	// Authenticated message: now enforce ordering.
 	c.recvMu.Lock()
-	err := c.checkSeq(seq)
+	err = c.checkSeq(seq)
 	c.recvMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	nonce := seqNonce(seq)
-	return c.recv.Open(nil, nonce[:], data[8:], nil)
+	return plain, nil
 }
 
 // --- Key confirmation ---

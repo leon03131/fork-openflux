@@ -346,32 +346,57 @@ type Stream struct {
 	sendNotify chan struct{} // cap 1
 	closedCh   chan struct{}
 	closeOnce  sync.Once
-	deadlineMu sync.Mutex
-	// Separate read/write deadline notifications: SetReadDeadline must
-	// wake pending Reads, SetWriteDeadline pending Writes, SetDeadline
-	// both (net.Conn semantics: deadlines affect pending I/O).
-	readDeadlineNotify  chan struct{} // cap 1
-	writeDeadlineNotify chan struct{} // cap 1
-	readDeadline        time.Time
-	writeDeadline       time.Time
+	// Deadline broadcast: generation channels wake ALL pending waiters
+	// (net.Conn allows concurrent I/O from multiple goroutines).
+	readDeadline  broadcast
+	writeDeadline broadcast
 	// bufferReleased guards one-time release of the global buffer
 	// accounting on terminal close.
 	bufferReleased bool
 }
 
+// broadcast is a generation-based notify protecting a deadline value:
+// Wait returns the current generation channel and value; Set wakes ALL
+// current waiters (net.Conn allows concurrent I/O from many goroutines).
+type broadcast struct {
+	mu sync.Mutex
+	ch chan struct{}
+	t  time.Time
+}
+
+func newBroadcast() broadcast {
+	return broadcast{ch: make(chan struct{})}
+}
+
+func (b *broadcast) Set(t time.Time) {
+	b.mu.Lock()
+	b.t = t
+	close(b.ch)
+	b.ch = make(chan struct{})
+	b.mu.Unlock()
+}
+
+// Wait returns the current generation channel and the deadline value,
+// atomically.
+func (b *broadcast) Wait() (<-chan struct{}, time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ch, b.t
+}
+
 func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 	return &Stream{
-		id:                  id,
-		m:                   m,
-		destHost:            destHost,
-		destPort:            destPort,
-		openCh:              make(chan error, 1),
-		sendWindow:          DefaultWindowSize,
-		recvNotify:          make(chan struct{}, 1),
-		sendNotify:          make(chan struct{}, 1),
-		closedCh:            make(chan struct{}),
-		readDeadlineNotify:  make(chan struct{}, 1),
-		writeDeadlineNotify: make(chan struct{}, 1),
+		id:            id,
+		m:             m,
+		destHost:      destHost,
+		destPort:      destPort,
+		openCh:        make(chan error, 1),
+		sendWindow:    DefaultWindowSize,
+		recvNotify:    make(chan struct{}, 1),
+		sendNotify:    make(chan struct{}, 1),
+		closedCh:      make(chan struct{}),
+		readDeadline:  newBroadcast(),
+		writeDeadline: newBroadcast(),
 	}
 }
 
@@ -543,14 +568,15 @@ func (s *Stream) Read(b []byte) (int, error) {
 		}
 		s.mu.Unlock()
 
-		dch, expired := deadlineChan(s.getReadDeadline())
+		dlCh, deadline := s.readDeadline.Wait()
+		dch, expired := deadlineChan(deadline)
 		if expired {
 			return 0, errTimeout
 		}
 		select {
 		case <-s.recvNotify:
 		case <-s.closedCh:
-		case <-s.readDeadlineNotify: // deadline changed: recompute
+		case <-dlCh: // deadline changed: recompute
 		case <-dch:
 			return 0, errTimeout
 		}
@@ -563,14 +589,15 @@ func (s *Stream) Write(b []byte) (int, error) {
 		s.mu.Lock()
 		for s.sendWindow == 0 && !s.closed && !s.writeClosed {
 			s.mu.Unlock()
-			dch, expired := deadlineChan(s.getWriteDeadline())
+			dlCh, deadline := s.writeDeadline.Wait()
+			dch, expired := deadlineChan(deadline)
 			if expired {
 				return total, errTimeout
 			}
 			select {
 			case <-s.sendNotify:
 			case <-s.closedCh:
-			case <-s.writeDeadlineNotify: // deadline changed: recompute
+			case <-dlCh: // deadline changed: recompute
 			case <-dch:
 				return total, errTimeout
 			}
@@ -646,41 +673,19 @@ func (s *Stream) RemoteAddr() net.Addr {
 }
 
 func (s *Stream) SetDeadline(t time.Time) error {
-	s.deadlineMu.Lock()
-	s.readDeadline = t
-	s.writeDeadline = t
-	s.deadlineMu.Unlock()
-	notify(s.readDeadlineNotify)
-	notify(s.writeDeadlineNotify)
+	s.readDeadline.Set(t)
+	s.writeDeadline.Set(t)
 	return nil
 }
 
 func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.deadlineMu.Lock()
-	s.readDeadline = t
-	s.deadlineMu.Unlock()
-	notify(s.readDeadlineNotify)
+	s.readDeadline.Set(t)
 	return nil
 }
 
 func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.deadlineMu.Lock()
-	s.writeDeadline = t
-	s.deadlineMu.Unlock()
-	notify(s.writeDeadlineNotify)
+	s.writeDeadline.Set(t)
 	return nil
-}
-
-func (s *Stream) getReadDeadline() time.Time {
-	s.deadlineMu.Lock()
-	defer s.deadlineMu.Unlock()
-	return s.readDeadline
-}
-
-func (s *Stream) getWriteDeadline() time.Time {
-	s.deadlineMu.Lock()
-	defer s.deadlineMu.Unlock()
-	return s.writeDeadline
 }
 
 // deadlineChan returns a channel firing at the deadline, and expired=true
