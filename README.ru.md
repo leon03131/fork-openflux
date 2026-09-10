@@ -10,7 +10,7 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 ```
 
 ## Требования
-1. Golang v. 1.26.3+ — требуется для сборки бинарника десктопного клиента / выходной ноды (universal-bypass-tool);
+1. Golang v. 1.26.4+ — требуется для сборки бинарника десктопного клиента / выходной ноды;
 2. Android Native Development Kit (NDK) v.27.0.12077973+ — требуется для сборки бинарника для Android-клиента;
 3. XCode v. 26.6+ — требуется для сборки бинарника для iOS-клиента;
 4. VPS / VDS выходная нода на Linux.
@@ -19,26 +19,27 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 TCP-пакеты передаются через Transport. На данный момент доступны два транспорта:
 1. Yandex — отправляет пакеты через курсорные сообщения Yandex Docs;
-2. Max — отправляет пакеты через WebRTC DataChannel.
+2. Max — отправляет пакеты, замаскированные под WebRTC ICE-кандидаты, через сигнальный канал звонка MAX.
 
 Клиентская часть запускает SOCKS5-прокси, выходная нода декапсулирует и пересылает пакеты в пункт назначения.
 
 ## Структура
 
 ```
-universal-bypass-tool/
 ├── main.go
 ├── transport/
-│   ├── transport.go      # Transport interface
-│   └── yandex/           # Yandex Docs backend
-│   └── oneme/            # MAX Messenger backend
+│   ├── transport.go        # Интерфейс Transport
+│   ├── compressor.go       # LZ4-сжатие
+│   ├── yandex/             # Yandex Docs бэкенд
+│   └── oneme/              # MAX Messenger бэкенд
 ├── tunnel/
-│   ├── tunnel.go         # TCP tunnel core
-│   ├── endpoint.go       # Virtual NIC
-│   └── rawsocket.go      # Raw socket (exit node)
-├── socks5/               # SOCKS5 server
-├── network/              # Checksums, packet parsing
-└── utils/                # Debug logging
+│   ├── tunnel.go           # Ядро TCP-туннеля
+│   ├── endpoint.go         # Виртуальный NIC
+│   ├── rawsocket_common.go # Общая логика raw-сокета (нода)
+│   └── rawsocket_{linux,windows,darwin}.go  # Платформенный код сокетов
+├── socks5/                 # SOCKS5-сервер
+├── network/                # Чексуммы, парсинг пакетов
+└── utils/                  # Отладочное логирование
 ```
 
 ## Сборка (бинарник десктоп-клиента / выходной ноды)
@@ -72,27 +73,27 @@ sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
 sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
-### 1. Настройка десктопного клиента:
+### 2. Настройка десктопного клиента:
 
 Команды для настройки десктопного клиента:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
+./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080 --debug
 ```
 
 Затем настройте SOCKS5-прокси в браузере на localhost:1080.
 
 ## Флаги
 
-| Флаг          | По умолчанию        | Описание                       |
-|---------------|---------------------|--------------------------------|
-| `--client`    |                     | Запуск в режиме клиента        |
-| `--exit-node` |                     | Запуск в режиме ноды           |
-| `--socks5`    | `:1080`             | Адрес SOCKS5 прокси            |
-| `--url`       | `https://localhost` | URL документа (Yandex Docs)    |
-| `--maxToken`  | ``                  | Токен авторизации (Max)        |
-| `--maxUid`    | ``                  | ID пользователя (Max)          |
-| `--debug`     | `false`             | Включить подробное логирование |
-| `--transport` | `yandex`            | Выбор транспорта               |
+| Флаг          | По умолчанию        | Описание                            |
+|---------------|---------------------|-------------------------------------|
+| `--client`    |                     | Запуск в режиме клиента             |
+| `--exit-node` |                     | Запуск в режиме ноды                |
+| `--socks5`    | `127.0.0.1:1080`    | Адрес SOCKS5 прокси                 |
+| `--url`       |                     | URL документа (Yandex Docs)         |
+| `--maxToken`  | ``                  | MAX Web токен (транспорт oneme)     |
+| `--maxUid`    | ``                  | ID пользователя для звонка (oneme)  |
+| `--debug`     | `false`             | Включить подробное логирование      |
+| `--transport` | `yandex`            | Тип транспорта (yandex, oneme)      |
 
 ## Реализация собственных транспортов
 

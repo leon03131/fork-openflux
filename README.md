@@ -10,7 +10,7 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 ```
 
 ## Requirements
-1. Golang v. 1.26.3+ - is required for building desktop client / exit node binary (universal-bypass-tool);
+1. Golang v. 1.26.4+ - is required for building desktop client / exit node binary;
 2. Android Native Development Kit (NDK) v.27.0.12077973+ - is required for building Android client binary;
 3. XCode v. 26.6+ - is required for building iOS client binary;
 4. Linux VPS / VDS exit node.
@@ -19,26 +19,27 @@ Client (SOCKS5) --> Transport --> Exit Node --> Internet
 
 TCP packets are sent via Transport. Currently, there are two transports available:
 1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets via WebRTC DataChannel.
+2. Max - sends packets disguised as WebRTC ICE candidates over the MAX call signaling channel.
 
 Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
 
 ## Structure
 
 ```
-universal-bypass-tool/
 ├── main.go
 ├── transport/
-│   ├── transport.go      # Transport interface
-│   └── yandex/           # Yandex Docs backend
-│   └── oneme/            # MAX Messenger backend
+│   ├── transport.go        # Transport interface
+│   ├── compressor.go       # LZ4 compression wrapper
+│   ├── yandex/             # Yandex Docs backend
+│   └── oneme/              # MAX Messenger backend
 ├── tunnel/
-│   ├── tunnel.go         # TCP tunnel core
-│   ├── endpoint.go       # Virtual NIC
-│   └── rawsocket.go      # Raw socket (exit node)
-├── socks5/               # SOCKS5 server
-├── network/              # Checksums, packet parsing
-└── utils/                # Debug logging
+│   ├── tunnel.go           # TCP tunnel core
+│   ├── endpoint.go         # Virtual NIC
+│   ├── rawsocket_common.go # Raw socket shared logic (exit node)
+│   └── rawsocket_{linux,windows,darwin}.go  # Platform socket code
+├── socks5/                 # SOCKS5 server
+├── network/                # Checksums, packet parsing
+└── utils/                  # Debug logging
 ```
 
 ## Build (desktop client / exit-node binary)
@@ -72,11 +73,11 @@ sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
 sudo ./universal-bypass-tool --exit-node --url "YOUR_YANDEX_DOC_URL" --debug
 ```
 
-### 1. Setting up desktop client:
+### 2. Setting up desktop client:
 
 Setup commands for desktop client:
 ```bash
-./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 :1080 --debug
+./universal-bypass-tool --client --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080 --debug
 ```
 
 Then set up SOCKS5 proxy in your browser at localhost:1080.
@@ -85,14 +86,14 @@ Then set up SOCKS5 proxy in your browser at localhost:1080.
 
 | Flag          | Default             | Description                |
 |---------------|---------------------|----------------------------|
-| `--client`    |                     | Run as client              |
-| `--exit-node` |                     | Run as exit node           |
-| `--socks5`    | `:1080`             | SOCKS5 listen address      |
-| `--url`       | `https://localhost` | Document URL (Yandex Docs) |
-| `--maxToken`  | ``                  | Auth token (Max)           |
-| `--maxUid`    | ``                  | User ID (Max)              |
-| `--debug`     | `false`             | Enable verbose logging     |
-| `--transport` | `yandex`            | Select transport backend   |
+| `--client`    |                     | Run as client                     |
+| `--exit-node` |                     | Run as exit node                  |
+| `--socks5`    | `127.0.0.1:1080`    | SOCKS5 listen address             |
+| `--url`       |                     | Document URL (Yandex Docs)        |
+| `--maxToken`  | ``                  | MAX Web token (oneme transport)   |
+| `--maxUid`    | ``                  | MAX call user id (oneme transport)|
+| `--debug`     | `false`             | Enable verbose logging            |
+| `--transport` | `yandex`            | Transport type (yandex, oneme)    |
 
 ## Implementing custom transports
 
