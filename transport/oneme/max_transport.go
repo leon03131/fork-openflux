@@ -73,6 +73,10 @@ func (t *OneMeTransport) IsConnected() bool {
 	return t.b.IsConnected()
 }
 
+// MaxPayload is the raw message budget for the MAX signaling carrier
+// (payloads are base64-wrapped into JSON "ICE candidate" messages).
+func (t *OneMeTransport) MaxPayload() int { return 16 * 1024 }
+
 func (t *OneMeTransport) Send(data []byte) error {
 	if !t.b.IsConnected() {
 		return fmt.Errorf("transport not connected")

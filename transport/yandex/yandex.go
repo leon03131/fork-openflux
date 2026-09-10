@@ -55,6 +55,11 @@ type YandexDocsTransport struct {
 	baseUserID  string
 }
 
+// MaxPayload is the raw message budget for the Yandex Docs carrier.
+// Payloads are base64-wrapped into JSON cursor messages, so the wire size
+// is ~4/3x; 24 KiB raw stays well within websocket message limits.
+func (t *YandexDocsTransport) MaxPayload() int { return 24 * 1024 }
+
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
 	t := &YandexDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),

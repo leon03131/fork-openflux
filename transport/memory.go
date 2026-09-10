@@ -35,6 +35,9 @@ func NewMemoryTransportPair(config TransportConfig) (*MemoryTransport, *MemoryTr
 	return a, b
 }
 
+// MaxPayload implements the session payloadCapacitor extension.
+func (m *MemoryTransport) MaxPayload() int { return 256 * 1024 }
+
 func (m *MemoryTransport) Start() error {
 	if err := m.BaseTransport.Start(); err != nil {
 		return err
