@@ -22,7 +22,3 @@ func Debugf(format string, args ...interface{}) {
 		debugLog.Output(2, fmt.Sprintf(format, args...))
 	}
 }
-
-func IsVerbose() bool {
-	return verbose
-}

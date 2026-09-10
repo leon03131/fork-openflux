@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/windows"
 
@@ -67,6 +68,7 @@ func (e *RawSocketEndpoint) readLoop() {
 		n, _, err := windows.Recvfrom(e.recvFd, buf, 0)
 		if err != nil {
 			if err == windows.WSAEWOULDBLOCK {
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			utils.Debugf("[RAW-NIC%d] Read error: %v", e.nicID, err)

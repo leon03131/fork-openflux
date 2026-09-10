@@ -106,12 +106,6 @@ func (b *BaseTransport) CallReceive(data []byte) {
 	}
 }
 
-func (b *BaseTransport) GetSession(accessor func(interface{})) {
-	b.Mu.RLock()
-	defer b.Mu.RUnlock()
-	// This is a helper for subclasses
-}
-
 func (b *BaseTransport) Stats() TransportStats {
 	return TransportStats{
 		BytesSent:     atomic.LoadUint64(&b.stats.BytesSent),

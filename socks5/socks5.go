@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,9 +16,8 @@ import (
 const (
 	socksVersion5 = 0x05
 
-	cmdConnect      = 0x01
-	cmdBind         = 0x02
-	cmdUDPAssociate = 0x03
+	cmdConnect = 0x01
+	// BIND (0x02) and UDP ASSOCIATE (0x03) are intentionally not supported.
 
 	atypIPv4   = 0x01
 	atypDomain = 0x03
@@ -31,9 +31,8 @@ const (
 
 	methodNoAuth = 0x00
 
-	maxDomainLen = 255
-
 	handshakeTimeout = 30 * time.Second
+	dialTimeout      = 20 * time.Second
 )
 
 type Dialer interface {
@@ -61,6 +60,14 @@ func (s *SOCKS5Server) Start() error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// A permanent listener error (e.g. closed socket) must not
+			// spin the loop forever.
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && !ne.Timeout() {
+				return err
+			}
 			utils.Debugf("[SOCKS5] Accept error: %v", err)
 			continue
 		}
@@ -86,7 +93,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 	utils.Debugf("[SOCKS5] CONNECT %s", targetAddr)
 
-	targetConn, err := s.dialer.DialTCP(targetAddr)
+	targetConn, err := s.dialWithTimeout(targetAddr)
 	if err != nil {
 		utils.Debugf("[SOCKS5] Dial failed: %v", err)
 		s.writeReply(clientConn, repHostUnreachable)
@@ -166,8 +173,8 @@ func (s *SOCKS5Server) negotiate(conn net.Conn) (target string, replyCode byte, 
 			return "", repSucceeded, fmt.Errorf("read domain len: %w", err)
 		}
 		dlen := int(lenBuf[0])
-		if dlen == 0 || dlen > maxDomainLen {
-			return "", repGeneralFailure, fmt.Errorf("bad domain length %d", dlen)
+		if dlen == 0 {
+			return "", repGeneralFailure, fmt.Errorf("empty domain")
 		}
 		buf := make([]byte, dlen+2)
 		if _, err := io.ReadFull(conn, buf); err != nil {
@@ -187,6 +194,28 @@ func (s *SOCKS5Server) negotiate(conn net.Conn) (target string, replyCode byte, 
 	}
 
 	return target, repSucceeded, nil
+}
+
+// dialWithTimeout bounds the dial: gonet.DialTCP has no connect timeout of
+// its own, so a dead route would otherwise hang the handshake forever.
+// Note: on timeout the abandoned dial goroutine may linger inside the
+// network stack until its own retransmission timeout expires.
+func (s *SOCKS5Server) dialWithTimeout(address string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := s.dialer.DialTCP(address)
+		ch <- result{conn, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-time.After(dialTimeout):
+		return nil, fmt.Errorf("dial %s: timeout", address)
+	}
 }
 
 func (s *SOCKS5Server) writeReply(conn net.Conn, rep byte) error {

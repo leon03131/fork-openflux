@@ -143,11 +143,11 @@ func TestFragmentedWrites(t *testing.T) {
 	if _, err := io.ReadFull(c, resp); err != nil {
 		t.Fatalf("read response: %v", err)
 	}
-	if resp[1] != 0x00 || resp[11-10+1] != repSucceeded {
-		// method chosen = 0x00, connect reply = 0x00
-		if resp[1] != 0x00 || resp[3] != repSucceeded {
-			t.Fatalf("unexpected response: %v", resp)
-		}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		t.Fatalf("bad method choice: %v", resp[:2])
+	}
+	if resp[2] != 0x05 || resp[3] != repSucceeded {
+		t.Fatalf("bad connect reply: %v", resp[2:])
 	}
 	if dialer.gotAddr != "10.0.0.1:8080" {
 		t.Fatalf("dialed %q, want 10.0.0.1:8080", dialer.gotAddr)

@@ -3,7 +3,6 @@ package tunnel
 import (
 	"fmt"
 	"net"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -24,7 +23,6 @@ type TCPTunnel struct {
 	isExitNode  bool
 	rawEP       *RawSocketEndpoint
 	startTime   time.Time
-	packetCount atomic.Uint64
 }
 
 func NewTCPTunnel(trans transport.Transport, isExitNode bool) (*TCPTunnel, error) {
@@ -187,9 +185,17 @@ func (t *TCPTunnel) printStats() {
 
 	for range ticker.C {
 		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v packets=%d connected=%d established=%d retrans=%d",
+		var rawIn, rawOut uint64
+		if t.rawEP != nil {
+			rawIn = t.rawEP.packetIn.Load()
+			rawOut = t.rawEP.packetOut.Load()
+		}
+		utils.Debugf("[STATS] uptime=%v tunnel_in=%d tunnel_out=%d raw_in=%d raw_out=%d connected=%d established=%d retrans=%d",
 			time.Since(t.startTime).Round(time.Second),
-			t.packetCount.Load(),
+			t.tunnelEP.packetIn.Load(),
+			t.tunnelEP.packetOut.Load(),
+			rawIn,
+			rawOut,
 			stats.TCP.CurrentConnected.Value(),
 			stats.TCP.CurrentEstablished.Value(),
 			stats.TCP.Retransmits.Value(),

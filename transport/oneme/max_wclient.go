@@ -81,14 +81,16 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 }
 
 func (c *MaxClient) LoginByToken(token string) error {
-	c.invoke(6, map[string]interface{}{
+	if _, err := c.invoke(6, map[string]interface{}{
 		"userAgent": map[string]interface{}{
 			"deviceType": "WEB", "locale": "ru_RU", "osVersion": "macOS",
 			"deviceName": "vkmax Go", "appVersion": "25.9.15",
 			"screen": "956x1470 2.0x", "timezone": "Asia/Vladivostok",
 		},
 		"deviceId": c.deviceID,
-	})
+	}); err != nil {
+		return fmt.Errorf("userAgent handshake: %w", err)
+	}
 	resp, err := c.invoke(19, map[string]interface{}{
 		"interactive": true, "token": token, "chatsSync": 0,
 		"contactsSync": 0, "presenceSync": 0, "draftsSync": 0, "chatsCount": 40,

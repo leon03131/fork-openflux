@@ -157,6 +157,10 @@ func (s *rawSocketState) prepareOutgoing(ipPacket []byte) (prepared []byte, dst 
 		return nil, dst, false
 	}
 
+	if ipPacket[9] != 6 { // tunnel is TCP-only; do not mangle other protocols
+		return nil, dst, false
+	}
+
 	pkt := make([]byte, len(ipPacket))
 	copy(pkt, ipPacket)
 
@@ -171,6 +175,9 @@ func (s *rawSocketState) prepareOutgoing(ipPacket []byte) (prepared []byte, dst 
 		seq := binary.BigEndian.Uint32(tcp[4:8])
 		s.outgoingSYNs.Store(seq, struct{}{})
 		s.activeFlows.Store(srcPort, struct{}{})
+		// A new SYN on a port that is still in the closing grace period
+		// means the port was reused: cancel the pending cleanup.
+		s.closingFlows.Delete(srcPort)
 	}
 	if flags&(tcpFlagFIN|tcpFlagRST) != 0 {
 		s.closingFlows.Store(srcPort, time.Now())

@@ -2,11 +2,11 @@ package oneme
 
 import (
 	"encoding/json"
-	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v3"
 )
 
 type MaxPacket struct {
@@ -59,28 +59,20 @@ type CallHandler struct {
 	pc                *webrtc.PeerConnection
 	dc                *webrtc.DataChannel
 	conn              *websocket.Conn
-	connMu            sync.RWMutex
 	localID           int64
-	remoteID          int64
 	seq               int64
-	seqMu             sync.Mutex
-	onConnected       func()
-	callAccepted      bool
-	acceptSent        bool
+	callAccepted      atomic.Bool
+	acceptSent        atomic.Bool
 	hasRemoteDesc     bool
 	pendingCandidates []map[string]interface{}
 	dcInbound         func([]byte)
 	msgHandler        func(string)
-	lastRecvTime      time.Time
-	lastRecvMu        sync.RWMutex
-	lastPongTime      time.Time
-	lastPongMu        sync.RWMutex
 	reconnectCh       chan struct{}
-	doneCh            chan struct{}
-	calleeID          int64
-	client            *MaxClient
-	running           atomic.Bool
 	connected         atomic.Bool
 	onStateChange     func(bool)
-	mu                sync.Mutex
+	// mu guards conn, pc, dc, localID and seq.
+	mu sync.Mutex
+	// msgMu serializes signaling message handlers (they are dispatched
+	// as goroutines from the read loop).
+	msgMu sync.Mutex
 }

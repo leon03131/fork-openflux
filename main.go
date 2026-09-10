@@ -55,6 +55,9 @@ func main() {
 
 	switch *transportType {
 	case "yandex":
+		if globalDocUrl == "" || globalDocUrl == "http://#" {
+			log.Fatalf("--url is required for the yandex transport (Yandex Docs document URL)")
+		}
 		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(globalDocUrl, config))
 	case "oneme":
 		uidint, err := strconv.ParseInt(maxUid, 10, 64)
@@ -72,6 +75,7 @@ func main() {
 
 	tun, err := tunnel.NewTCPTunnel(trans, *exitNode)
 	if err != nil {
+		trans.Stop() // do not leave the transport running after a failed init
 		log.Fatalf("Failed to init tunnel: %v", err)
 	}
 

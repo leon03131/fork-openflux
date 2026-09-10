@@ -15,13 +15,17 @@ var (
 	useICEInjection = true
 )
 
-func (h *CallHandler) SetOnConnected(cb func())     { h.onConnected = cb }
-func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
-
 // setConnected updates the connection state and notifies the transport.
 func (h *CallHandler) setConnected(connected bool) {
 	if h.connected.Swap(connected) != connected && h.onStateChange != nil {
 		h.onStateChange(connected)
+	}
+}
+
+// deliverInbound passes received payload to the transport (nil-safe).
+func (h *CallHandler) deliverInbound(data []byte) {
+	if h.dcInbound != nil {
+		h.dcInbound(data)
 	}
 }
 
@@ -38,28 +42,36 @@ func (h *CallHandler) Send(data []byte) error {
 	return dc.Send(data)
 }
 
-func (h *CallHandler) readLoop() {
+// readLoop processes the signaling websocket. The connection is captured
+// as a parameter so a superseded connection never interferes with the
+// current one.
+func (h *CallHandler) readLoop(conn *websocket.Conn) {
 	logInfo("[%s] Signaling connected", h.tag)
 	for {
-		_, message, err := h.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			logError("[%s] Signaling disconnected: %v", h.tag, err)
-			h.setConnected(false)
-			h.signalReconnect()
+			h.mu.Lock()
+			current := h.conn == conn
+			h.mu.Unlock()
+			if current {
+				h.setConnected(false)
+				h.signalReconnect()
+			}
 			return
 		}
 		text := string(message)
 
 		if strings.Contains(text, "accepted-call") {
 			logInfo("[%s] call accepted", h.tag)
-			h.callAccepted = true
+			h.callAccepted.Store(true)
 			continue
 		}
 
 		if text == "ping" {
 			h.mu.Lock()
-			if h.conn != nil {
-				h.conn.WriteMessage(websocket.TextMessage, []byte("pong"))
+			if h.conn == conn {
+				conn.WriteMessage(websocket.TextMessage, []byte("pong"))
 			}
 			h.mu.Unlock()
 			continue
@@ -79,10 +91,13 @@ func (h *CallHandler) readLoop() {
 			continue
 		}
 
-		if pid, ok := data["participantId"].(float64); ok {
-			h.remoteID = int64(pid)
-		}
-		go h.msgHandler(text)
+		// Handlers mutate shared state and may block; run them
+		// serialized so they never race each other.
+		go func() {
+			h.msgMu.Lock()
+			defer h.msgMu.Unlock()
+			h.msgHandler(text)
+		}()
 	}
 }
 
@@ -107,10 +122,9 @@ func (h *CallHandler) signalReconnect() {
 }
 
 func (h *CallHandler) sendAcceptCall() {
-	if h.acceptSent {
+	if !h.acceptSent.CompareAndSwap(false, true) {
 		return
 	}
-	h.acceptSent = true
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.conn == nil {
@@ -122,17 +136,41 @@ func (h *CallHandler) sendAcceptCall() {
 	logInfo("[%s] Accept-call sent", h.tag)
 }
 
+// resetCallState clears all per-call state. Caller must hold h.msgMu.
+func (h *CallHandler) resetCallState() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.callAccepted.Store(false)
+	h.acceptSent.Store(false)
+	h.hasRemoteDesc = false
+	h.pendingCandidates = nil
+	h.localID = 0
+	h.seq = 1
+	if h.pc != nil {
+		h.pc.Close()
+		h.pc = nil
+	}
+	h.dc = nil
+}
+
 func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 	logInfo("[%s] Creating PeerConnection...", h.tag)
-	turn := convParams["turn"].(map[string]interface{})
-	stun := convParams["stun"].(map[string]interface{})
+
+	// Everything below is untrusted provider input: no panicking
+	// type assertions.
+	turn, _ := convParams["turn"].(map[string]interface{})
+	stun, _ := convParams["stun"].(map[string]interface{})
 	var stunURLs, turnURLs []string
 	if urls, ok := stun["urls"].([]interface{}); ok && len(urls) > 0 {
-		stunURLs = []string{urls[0].(string)}
+		if u, ok := urls[0].(string); ok {
+			stunURLs = []string{u}
+		}
 	}
 	if urls, ok := turn["urls"].([]interface{}); ok {
 		for _, u := range urls {
-			turnURLs = append(turnURLs, u.(string))
+			if s, ok := u.(string); ok {
+				turnURLs = append(turnURLs, s)
+			}
 		}
 	}
 	username, _ := turn["username"].(string)
@@ -156,7 +194,12 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 		logError("[%s] ERROR creating PC: %v", h.tag, err)
 		return
 	}
+	h.mu.Lock()
+	if h.pc != nil {
+		h.pc.Close()
+	}
 	h.pc = pc
+	h.mu.Unlock()
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
@@ -172,10 +215,6 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 	})
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		logInfo("[%s] Connection: %s", h.tag, s.String())
-		if s == webrtc.PeerConnectionStateConnected && h.onConnected != nil {
-			logInfo("[%s] *** CONNECTED! ***", h.tag)
-			h.onConnected()
-		}
 	})
 	pc.OnSignalingStateChange(func(s webrtc.SignalingState) {
 		logInfo("[%s] Signaling: %s", h.tag, s.String())
@@ -186,10 +225,11 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 			dcID = *dc.ID()
 		}
 		logInfo("[%s] Remote DC: %s (id=%d)", h.tag, dc.Label(), dcID)
+		h.mu.Lock()
 		h.dc = dc
+		h.mu.Unlock()
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			logInfo("[%s] RECV: %s", h.tag, string(msg.Data))
-			h.dcInbound(msg.Data)
+			h.deliverInbound(msg.Data)
 		})
 	})
 
@@ -206,14 +246,12 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 		logError("[%s] DC is nil", h.tag)
 		return
 	}
+	h.mu.Lock()
 	h.dc = dc
-	//_ := uint16(0)
-	//if dc.ID() != nil {
-	//	dcID = *dc.ID()
-	//}
+	h.mu.Unlock()
 	dc.OnOpen(func() { logInfo("[%s] DC opened", h.tag) })
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		h.dcInbound(msg.Data)
+		h.deliverInbound(msg.Data)
 	})
 }
 
@@ -276,7 +314,10 @@ func (h *CallHandler) sendICE(candidateJSON string) {
 }
 
 func (h *CallHandler) addICECandidate(c map[string]interface{}) {
-	if h.pc == nil {
+	h.mu.Lock()
+	pc := h.pc
+	h.mu.Unlock()
+	if pc == nil {
 		return
 	}
 	candidateStr, _ := c["candidate"].(string)
@@ -285,7 +326,7 @@ func (h *CallHandler) addICECandidate(c map[string]interface{}) {
 	if idx, ok := c["sdpMLineIndex"].(float64); ok {
 		sdpMLineIndex = uint16(idx)
 	}
-	if err := h.pc.AddICECandidate(webrtc.ICECandidateInit{
+	if err := pc.AddICECandidate(webrtc.ICECandidateInit{
 		Candidate: candidateStr, SDPMid: &sdpMid, SDPMLineIndex: &sdpMLineIndex,
 	}); err != nil {
 		logError("[%s] ICE error: %v", h.tag, err)
@@ -313,7 +354,10 @@ func (h *CallHandler) flushPendingCandidates() {
 }
 
 func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
-	if h.pc == nil {
+	h.mu.Lock()
+	pc := h.pc
+	h.mu.Unlock()
+	if pc == nil {
 		return
 	}
 	logInfo("[%s] handleSDP: %s (%d bytes)", h.tag, sdpType, len(sdpStr))
@@ -321,7 +365,7 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 	switch sdpType {
 	case "offer":
 		logInfo("[%s] Setting remote offer...", h.tag)
-		if err := h.pc.SetRemoteDescription(webrtc.SessionDescription{
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeOffer, SDP: sdpStr,
 		}); err != nil {
 			logError("[%s] ERROR: %v", h.tag, err)
@@ -332,17 +376,17 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 		h.flushPendingCandidates()
 
 		logInfo("[%s] Creating answer...", h.tag)
-		answer, err := h.pc.CreateAnswer(nil)
+		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
 			logError("[%s] ERROR: %v", h.tag, err)
 			return
 		}
-		//h.pc.SetLocalDescription(answer)
+		//pc.SetLocalDescription(answer)
 		h.sendSDP(answer.SDP, "answer")
 
 	case "answer":
 		logInfo("[%s] Setting remote answer...", h.tag)
-		if err := h.pc.SetRemoteDescription(webrtc.SessionDescription{
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 			Type: webrtc.SDPTypeAnswer, SDP: sdpStr,
 		}); err != nil {
 			logError("[%s] ERROR: %v", h.tag, err)
@@ -353,6 +397,67 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 	}
 }
 
+// detectLocalID extracts our participant id from a conversation object.
+// All input is provider-controlled: no panicking type assertions.
+func (h *CallHandler) detectLocalID(data map[string]interface{}, wantCreator bool) {
+	h.mu.Lock()
+	already := h.localID != 0
+	h.mu.Unlock()
+	if already {
+		return
+	}
+	conv, ok := data["conversation"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	parts, ok := conv["participants"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, p := range parts {
+		part, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		roles, _ := part["roles"].([]interface{})
+		isCreator := false
+		for _, r := range roles {
+			if rs, ok := r.(string); ok && rs == "CREATOR" {
+				isCreator = true
+			}
+		}
+		if isCreator == wantCreator {
+			if id, ok := part["id"].(float64); ok {
+				h.mu.Lock()
+				if h.localID == 0 {
+					h.localID = int64(id)
+				}
+				localID := h.localID
+				h.mu.Unlock()
+				logInfo("[%s] Local ID: %d", h.tag, localID)
+				return
+			}
+		}
+	}
+}
+
+// handleCandidate processes a data.candidate signaling message: in ICE
+// injection mode it carries a base64 payload, otherwise it is a real
+// ICE candidate for the peer connection.
+func (h *CallHandler) handleCandidate(c map[string]interface{}) {
+	if useICEInjection {
+		candidateStr, _ := c["candidate"].(string)
+		decoded, err := base64.StdEncoding.DecodeString(candidateStr)
+		if err != nil {
+			logError("[%s] bad injected candidate: %v", h.tag, err)
+			return
+		}
+		h.deliverInbound(decoded)
+		return
+	}
+	h.bufferOrAddICE(c)
+}
+
 func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h := &CallHandler{tag: "CALLER", role: "caller"}
 	h.seq = 1
@@ -361,44 +466,29 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
 
-		if h.localID == 0 {
-			if conv, ok := data["conversation"].(map[string]interface{}); ok {
-				if parts, ok := conv["participants"].([]interface{}); ok {
-					for _, p := range parts {
-						part := p.(map[string]interface{})
-						roles, _ := part["roles"].([]interface{})
-						isCreator := false
-						for _, r := range roles {
-							if r.(string) == "CREATOR" {
-								isCreator = true
-							}
-						}
-						if !isCreator {
-							h.localID = int64(part["id"].(float64))
-							logInfo("[%s] Local ID: %d", h.tag, h.localID)
-						}
-					}
-				}
-			}
-		}
+		// Our participant id is the one WITHOUT the CREATOR role.
+		h.detectLocalID(data, false)
 
 		if cp, ok := data["conversationParams"].(map[string]interface{}); ok {
 			logInfo("[%s] conversationParams - creating offer", h.tag)
-			for {
-				time.Sleep(1 * time.Second)
-				fmt.Println("waiting for accept ...")
-				if h.callAccepted || useICEInjection {
-					break
-				}
+			for !h.callAccepted.Load() && !useICEInjection {
+				time.Sleep(200 * time.Millisecond)
 			}
 			h.createPeerConnection(cp)
 			time.Sleep(200 * time.Millisecond)
-			offer, err := h.pc.CreateOffer(nil)
+			h.mu.Lock()
+			pc := h.pc
+			h.mu.Unlock()
+			if pc == nil {
+				logError("[%s] no peer connection, skipping offer", h.tag)
+				return
+			}
+			offer, err := pc.CreateOffer(nil)
 			if err != nil {
 				logError("[%s] ERROR: %v", h.tag, err)
 				return
 			}
-			//h.pc.SetLocalDescription(offer)
+			//pc.SetLocalDescription(offer)
 			h.sendSDP(offer.SDP, "offer")
 			return
 		}
@@ -408,22 +498,17 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 		}
 		if sdp, ok := d["sdp"].(map[string]interface{}); ok {
 			sdpType, _ := sdp["type"].(string)
+			sdpStr, _ := sdp["sdp"].(string)
 			if sdpType == "answer" {
 				if useICEInjection {
 					return
 				}
-				h.handleSDP(sdpType, sdp["sdp"].(string))
+				h.handleSDP(sdpType, sdpStr)
 			}
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {
-			if useICEInjection {
-				candidateStr, _ := c["candidate"].(string)
-				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
-				h.dcInbound(decode)
-			} else {
-				h.bufferOrAddICE(c)
-			}
+			h.handleCandidate(c)
 		}
 	}
 
@@ -432,30 +517,31 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	// Connect with auto-reconnect loop
 	go func() {
 		for {
-			h.mu.Lock()
-			h.callAccepted = false
-			h.acceptSent = false
-			h.hasRemoteDesc = false
-			h.pendingCandidates = nil
-			h.seq = 1
-			if h.pc != nil {
-				h.pc.Close()
-				h.pc = nil
-			}
-			h.dc = nil
-			h.mu.Unlock()
+			h.msgMu.Lock()
+			h.resetCallState()
+			h.msgMu.Unlock()
 
-			resp, _ := client.invoke(78, map[string]interface{}{
+			resp, err := client.invoke(78, map[string]interface{}{
 				"conversationId": genUUID(),
 				"calleeIds":      []int64{calleeID},
 				"internalParams": fmt.Sprintf(`{"deviceId":"%s","sdkVersion":"2.8.9","clientAppKey":"CNHIJPLGDIHBABABA","platform":"WEB","protocolVersion":5,"domainId":"","capabilities":"2A03F"}`, client.deviceID),
 				"isVideo":        false,
 			})
+			if err != nil {
+				logError("[CALLER] invoke error: %v, retrying...", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
 			var payload map[string]interface{}
 			json.Unmarshal(resp.Payload, &payload)
 			paramsStr, _ := payload["internalCallerParams"].(string)
 			var params InternalCallerParams
 			json.Unmarshal([]byte(paramsStr), &params)
+			if params.Endpoint == "" {
+				logError("[CALLER] empty call endpoint, retrying...")
+				time.Sleep(1 * time.Second)
+				continue
+			}
 
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
@@ -468,7 +554,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			h.conn = conn
 			h.mu.Unlock()
 			h.setConnected(true)
-			go h.readLoop()
+			go h.readLoop(conn)
 
 			// Wait for disconnect signal
 			<-h.reconnectCh
@@ -488,26 +574,8 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
 
-		if h.localID == 0 {
-			if conv, ok := data["conversation"].(map[string]interface{}); ok {
-				if parts, ok := conv["participants"].([]interface{}); ok {
-					for _, p := range parts {
-						part := p.(map[string]interface{})
-						roles, _ := part["roles"].([]interface{})
-						isCreator := false
-						for _, r := range roles {
-							if r.(string) == "CREATOR" {
-								isCreator = true
-							}
-						}
-						if isCreator {
-							h.localID = int64(part["id"].(float64))
-							logInfo("[%s] Local ID: %d", h.tag, h.localID)
-						}
-					}
-				}
-			}
-		}
+		// Our participant id is the one WITH the CREATOR role.
+		h.detectLocalID(data, true)
 
 		if cp, ok := data["conversationParams"].(map[string]interface{}); ok {
 			h.createPeerConnection(cp)
@@ -518,17 +586,13 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			return
 		}
 		if sdp, ok := d["sdp"].(map[string]interface{}); ok {
-			h.handleSDP(sdp["type"].(string), sdp["sdp"].(string))
+			sdpType, _ := sdp["type"].(string)
+			sdpStr, _ := sdp["sdp"].(string)
+			h.handleSDP(sdpType, sdpStr)
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {
-			if useICEInjection {
-				candidateStr, _ := c["candidate"].(string)
-				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
-				h.dcInbound(decode)
-			} else {
-				h.bufferOrAddICE(c)
-			}
+			h.handleCandidate(c)
 		}
 	}
 
@@ -553,16 +617,24 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 				logError("[RECEIVER] Connect error: %v", err)
 				return
 			}
+
+			// New call: reset all per-call state and drop the previous
+			// signaling connection (its read loop will exit on its own).
+			h.msgMu.Lock()
+			h.resetCallState()
+			h.msgMu.Unlock()
+
 			h.mu.Lock()
+			if h.conn != nil {
+				h.conn.Close()
+			}
 			h.conn = conn
 			h.mu.Unlock()
 			h.setConnected(true)
-			go h.readLoop()
+			go h.readLoop(conn)
 			go func() {
 				time.Sleep(1 * time.Second)
-				if !h.acceptSent {
-					h.sendAcceptCall()
-				}
+				h.sendAcceptCall()
 			}()
 		}
 	})
