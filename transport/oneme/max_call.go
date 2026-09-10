@@ -51,13 +51,7 @@ func (h *CallHandler) readLoop(conn *websocket.Conn) {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			logError("[%s] Signaling disconnected: %v", h.tag, err)
-			h.mu.Lock()
-			current := h.conn == conn
-			h.mu.Unlock()
-			if current {
-				h.setConnected(false)
-				h.signalReconnect()
-			}
+			h.failConnection(conn)
 			return
 		}
 		text := string(message)
@@ -93,8 +87,28 @@ func (h *CallHandler) readLoop(conn *websocket.Conn) {
 
 		// Ordered FIFO dispatch: handlers may mutate state and block,
 		// and data frames must keep their arrival order.
-		h.msgCh <- text
+		select {
+		case h.msgCh <- text:
+		case <-h.done:
+			return
+		}
 	}
+}
+
+// failConnection atomically tears down the current connection if (and
+// only if) conn is still the active one: marks disconnected, closes and
+// clears it, and wakes the reconnect machinery.
+func (h *CallHandler) failConnection(conn *websocket.Conn) {
+	h.mu.Lock()
+	if h.conn != conn {
+		h.mu.Unlock()
+		return
+	}
+	h.conn.Close()
+	h.conn = nil
+	h.mu.Unlock()
+	h.setConnected(false)
+	h.signalReconnect()
 }
 
 // dispatchLoop is the single consumer of signaling messages, keeping
@@ -130,14 +144,9 @@ func (h *CallHandler) signalingWriter() {
 			conn.SetWriteDeadline(time.Time{})
 			if err != nil {
 				logError("[%s] signaling write failed: %v", h.tag, err)
-				// Broken connection: close it so the read loop wakes
-				// and the reconnect machinery kicks in.
-				h.mu.Lock()
-				if h.conn == conn {
-					h.conn.Close()
-					h.conn = nil
-				}
-				h.mu.Unlock()
+				// Broken connection: fail it (closes conn, marks
+				// disconnected, wakes reconnect machinery).
+				h.failConnection(conn)
 			}
 		case <-h.done:
 			return
@@ -660,8 +669,12 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			h.setConnected(true)
 			go h.readLoop(conn)
 
-			// Wait for disconnect signal
-			<-h.reconnectCh
+			// Wait for disconnect signal (or shutdown).
+			select {
+			case <-h.reconnectCh:
+			case <-h.done:
+				return
+			}
 			h.setConnected(false)
 			logInfo("[CALLER] Reconnecting in 1s...")
 			time.Sleep(1 * time.Second)

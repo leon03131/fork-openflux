@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -47,21 +48,17 @@ const (
 )
 
 var (
-	ErrClosed                = errors.New("mux: closed")
-	ErrStreamClosed          = errors.New("mux: stream closed")
-	ErrWriteClosed           = errors.New("mux: write side closed")
-	ErrOpenTimeout           = errors.New("mux: open timed out")
-	ErrStreamExists          = errors.New("mux: duplicate stream id")
-	ErrTooManyOpens          = errors.New("mux: too many pending streams")
-	errTimeout               = timeoutError{}
-	_               net.Conn = (*Stream)(nil)
+	ErrClosed       = errors.New("mux: closed")
+	ErrStreamClosed = errors.New("mux: stream closed")
+	ErrWriteClosed  = errors.New("mux: write side closed")
+	ErrOpenTimeout  = errors.New("mux: open timed out")
+	ErrStreamExists = errors.New("mux: duplicate stream id")
+	ErrTooManyOpens = errors.New("mux: too many pending streams")
+	// errTimeout is os.ErrDeadlineExceeded: it satisfies net.Error and
+	// errors.Is(os.ErrDeadlineExceeded), per the net.Conn contract.
+	errTimeout          = os.ErrDeadlineExceeded
+	_          net.Conn = (*Stream)(nil)
 )
-
-type timeoutError struct{}
-
-func (timeoutError) Error() string   { return "i/o timeout" }
-func (timeoutError) Timeout() bool   { return true }
-func (timeoutError) Temporary() bool { return true }
 
 type Mux struct {
 	sess *session.Session
@@ -350,27 +347,36 @@ type Stream struct {
 	closedCh   chan struct{}
 	closeOnce  sync.Once
 	deadlineMu sync.Mutex
-	// deadlineNotify wakes blocked Read/Write when deadlines change
-	// (net.Conn semantics: SetReadDeadline affects pending calls).
-	deadlineNotify chan struct{}
-	readDeadline   time.Time
-	writeDeadline  time.Time
+	// Separate read/write deadline notifications: SetReadDeadline must
+	// wake pending Reads, SetWriteDeadline pending Writes, SetDeadline
+	// both (net.Conn semantics: deadlines affect pending I/O).
+	readDeadlineNotify  chan struct{} // cap 1
+	writeDeadlineNotify chan struct{} // cap 1
+	readDeadline        time.Time
+	writeDeadline       time.Time
+	// bufferReleased guards one-time release of the global buffer
+	// accounting on terminal close.
+	bufferReleased bool
 }
 
 func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 	return &Stream{
-		id:             id,
-		m:              m,
-		destHost:       destHost,
-		destPort:       destPort,
-		openCh:         make(chan error, 1),
-		sendWindow:     DefaultWindowSize,
-		recvNotify:     make(chan struct{}, 1),
-		sendNotify:     make(chan struct{}, 1),
-		closedCh:       make(chan struct{}),
-		deadlineNotify: make(chan struct{}, 1),
+		id:                  id,
+		m:                   m,
+		destHost:            destHost,
+		destPort:            destPort,
+		openCh:              make(chan error, 1),
+		sendWindow:          DefaultWindowSize,
+		recvNotify:          make(chan struct{}, 1),
+		sendNotify:          make(chan struct{}, 1),
+		closedCh:            make(chan struct{}),
+		readDeadlineNotify:  make(chan struct{}, 1),
+		writeDeadlineNotify: make(chan struct{}, 1),
 	}
 }
+
+// Done returns a channel closed when the stream is fully closed.
+func (s *Stream) Done() <-chan struct{} { return s.closedCh }
 
 // IsClosed reports whether the stream is fully closed.
 func (s *Stream) IsClosed() bool {
@@ -461,6 +467,7 @@ func (s *Stream) remoteClose() {
 	s.mu.Lock()
 	s.readEOF = true
 	s.closed = true
+	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
 	notify(s.recvNotify)
@@ -471,10 +478,24 @@ func (s *Stream) closeNoSend() {
 	s.mu.Lock()
 	s.closed = true
 	s.readEOF = true
+	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
 	notify(s.recvNotify)
 	notify(s.sendNotify)
+}
+
+// releaseBufferLocked returns the remaining unread buffer's share of the
+// global session budget, exactly once. The buffer content itself stays
+// drainable (CLOSE is terminal, but in-flight data already delivered may
+// still be read). Caller must hold s.mu.
+func (s *Stream) releaseBufferLocked() {
+	if !s.bufferReleased {
+		s.bufferReleased = true
+		if n := s.recvBuf.Len(); n > 0 {
+			s.m.buffered.Add(-int64(n))
+		}
+	}
 }
 
 func notify(ch chan struct{}) {
@@ -492,6 +513,12 @@ func (s *Stream) Read(b []byte) (int, error) {
 		s.mu.Lock()
 		if s.recvBuf.Len() > 0 {
 			n, _ := s.recvBuf.Read(b)
+			if s.bufferReleased {
+				// Terminal close already released the accounting;
+				// just drain.
+				s.mu.Unlock()
+				return n, nil
+			}
 			s.recvUnacked -= n
 			s.m.buffered.Add(-int64(n))
 			credit := n + s.pendingCredit
@@ -523,7 +550,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 		select {
 		case <-s.recvNotify:
 		case <-s.closedCh:
-		case <-s.deadlineNotify: // deadline changed: recompute
+		case <-s.readDeadlineNotify: // deadline changed: recompute
 		case <-dch:
 			return 0, errTimeout
 		}
@@ -543,7 +570,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 			select {
 			case <-s.sendNotify:
 			case <-s.closedCh:
-			case <-s.deadlineNotify: // deadline changed: recompute
+			case <-s.writeDeadlineNotify: // deadline changed: recompute
 			case <-dch:
 				return total, errTimeout
 			}
@@ -623,7 +650,8 @@ func (s *Stream) SetDeadline(t time.Time) error {
 	s.readDeadline = t
 	s.writeDeadline = t
 	s.deadlineMu.Unlock()
-	notify(s.deadlineNotify)
+	notify(s.readDeadlineNotify)
+	notify(s.writeDeadlineNotify)
 	return nil
 }
 
@@ -631,7 +659,7 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 	s.deadlineMu.Lock()
 	s.readDeadline = t
 	s.deadlineMu.Unlock()
-	notify(s.deadlineNotify)
+	notify(s.readDeadlineNotify)
 	return nil
 }
 
@@ -639,7 +667,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.deadlineMu.Lock()
 	s.writeDeadline = t
 	s.deadlineMu.Unlock()
-	notify(s.deadlineNotify)
+	notify(s.writeDeadlineNotify)
 	return nil
 }
 

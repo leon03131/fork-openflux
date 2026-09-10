@@ -48,8 +48,10 @@ Android: `./build_android.sh` (нужен NDK, `-checklinkname=0` для anet). 
 ## Живой smoke-тест (Windows)
 
 ```powershell
-# Exit:   openflux.exe exit --transport direct --addr 127.0.0.1:9000 --psk test
-# Client: openflux.exe client --transport direct --addr 127.0.0.1:9000 --socks5 127.0.0.1:1080 --psk test
+# PSK: 32 случайных байта в base64 (openssl rand -base64 32). Для локального
+# smoke-теста можно --insecure без ключа.
+# Exit:   openflux.exe exit --transport direct --addr 127.0.0.1:9000 --insecure
+# Client: openflux.exe client --transport direct --addr 127.0.0.1:9000 --socks5 127.0.0.1:1080 --insecure
 # Проверка: curl.exe --socks5-hostname 127.0.0.1:1080 http://example.com/
 ```
 

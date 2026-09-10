@@ -161,8 +161,11 @@ func TestUndecryptableFramesKillSession(t *testing.T) {
 
 	select {
 	case <-sb.Closed():
-		if sb.Err() != ErrCryptoMismatch {
-			t.Fatalf("close reason = %v, want ErrCryptoMismatch", sb.Err())
+		// With strict ordering, foreign ciphertext is killed by the
+		// sequence check (replay/gap) or by AEAD failure accumulation:
+		// either way the session must die.
+		if sb.Err() == nil {
+			t.Fatal("session closed without a reason")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("session survived undecryptable frames")
@@ -262,7 +265,7 @@ func TestGapKillsOrdering(t *testing.T) {
 	// Strict in-order delivery: a lost message must be fatal, because
 	// the carrier contract is reliable+ordered.
 	first, _ := client.encrypt([]byte{1})
-	client.encrypt([]byte{2})  // seq 2: never delivered
+	client.encrypt([]byte{2}) // seq 2: never delivered
 	third, _ := client.encrypt([]byte{3})
 	if _, err := server.decrypt(first); err != nil {
 		t.Fatal(err)

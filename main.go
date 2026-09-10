@@ -197,8 +197,9 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 	return trans, nil
 }
 
-// validatePSK enforces PSK strength: 32-byte base64/hex keys are decoded;
-// passphrases must be >= 16 characters.
+// validatePSK enforces PSK strength: only real 32-byte random keys in
+// base64 or hex are accepted (Noise requires 256 bits of PSK entropy;
+// human passphrases are not allowed as they are offline-bruteforceable).
 func validatePSK(psk string) (string, error) {
 	if b, err := hex.DecodeString(psk); err == nil && len(b) == 32 {
 		return psk, nil // 32-byte hex key
@@ -206,10 +207,7 @@ func validatePSK(psk string) (string, error) {
 	if b, err := base64.StdEncoding.DecodeString(psk); err == nil && len(b) == 32 {
 		return psk, nil // 32-byte base64 key
 	}
-	if len(psk) < 16 {
-		return "", fmt.Errorf("PSK too weak: use %d+ chars, or a 32-byte base64/hex key (e.g. `openssl rand -base64 32`)", 16)
-	}
-	return psk, nil
+	return "", fmt.Errorf("PSK must be a 32-byte random key in base64 or hex; generate one with `openssl rand -base64 32`")
 }
 
 // runLegacy runs the original gVisor packet tunnel (exit node needs root).

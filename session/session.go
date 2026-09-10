@@ -177,7 +177,8 @@ func (s *Session) Start() error {
 		s.dispatch(f)
 	})
 	go s.writerLoop()
-	go s.keepaliveLoop()
+	// keepaliveLoop starts only after a successful Handshake so no
+	// control traffic is emitted mid-handshake.
 	return nil
 }
 
@@ -282,7 +283,9 @@ func (s *Session) Handshake() error {
 			// Encrypted immediately: proves our keys to the peer at once.
 			ping := make([]byte, 8)
 			binary.BigEndian.PutUint64(ping, uint64(time.Now().UnixNano()))
-			s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping})
+			if err := s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping}); err != nil {
+				utils.Debugf("[SESSION] confirmation ping failed: %v", err)
+			}
 		} else {
 			// The exit side is not Ready until the client confirms it
 			// knows the PSK (first valid encrypted frame).
@@ -300,6 +303,7 @@ func (s *Session) Handshake() error {
 	// From now on, loss of carrier connectivity kills the session; the
 	// supervisor builds a fresh one over the reconnected carrier.
 	go s.watchdog()
+	go s.keepaliveLoop()
 	return nil
 }
 

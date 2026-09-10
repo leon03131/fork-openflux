@@ -32,8 +32,10 @@ import (
 const (
 	nonceSize = chacha20poly1305.NonceSize
 	keySize   = chacha20poly1305.KeySize
-	// aeadOverhead = nonce + AEAD tag + 8-byte authenticated sequence.
-	aeadOverhead = nonceSize + chacha20poly1305.Overhead + 8
+	// aeadOverhead = 8-byte sequence + AEAD tag. The nonce is
+	// deterministically derived from the sequence and is NOT
+	// transmitted.
+	aeadOverhead = 8 + chacha20poly1305.Overhead
 
 	// keyConfirmTagLen = len("OPENFLUX-KC") + 64 pub bytes + AEAD tag.
 	keyConfirmTagLen = 11 + 64 + chacha20poly1305.Overhead
@@ -151,46 +153,47 @@ func deriveSession(psk []byte, priv *ecdh.PrivateKey, peerPubBytes []byte, isCli
 	return sc, nil
 }
 
-// encrypt wraps plaintext as [nonce][ciphertext(seq || plaintext)].
-// The 8-byte sequence travels inside the ciphertext, so it is
-// authenticated by the AEAD tag; the random nonce keeps drop tolerance
-// (a lost message does not desync counters).
-func (c *sessionCrypto) encrypt(plaintext []byte) ([]byte, error) {
-	nonce := make([]byte, nonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	seq := c.sendSeq.Add(1)
-	var seqBuf [8]byte
-	binary.BigEndian.PutUint64(seqBuf[:], seq)
-	body := append(seqBuf[:], plaintext...)
+// seqNonce derives the deterministic AEAD nonce from the sequence
+// number: unique per message under the session key, no randomness
+// needed (RFC 8439 counter nonce, same as Noise CipherState).
+func seqNonce(seq uint64) [nonceSize]byte {
+	var n [nonceSize]byte
+	binary.BigEndian.PutUint64(n[4:], seq)
+	return n
+}
 
-	out := make([]byte, 0, nonceSize+len(body)+chacha20poly1305.Overhead)
-	out = append(out, nonce...)
-	out = c.send.Seal(out, nonce, body, nil)
+// encrypt wraps plaintext as [8-byte seq][ciphertext]. The sequence is
+// sent in plaintext (it is not secret) and authenticated implicitly:
+// tampering with it changes the derived nonce and fails the AEAD tag.
+func (c *sessionCrypto) encrypt(plaintext []byte) ([]byte, error) {
+	seq := c.sendSeq.Add(1)
+	nonce := seqNonce(seq)
+	out := make([]byte, 0, 8+len(plaintext)+chacha20poly1305.Overhead)
+	var hdr [8]byte
+	binary.BigEndian.PutUint64(hdr[:], seq)
+	out = append(out, hdr[:]...)
+	out = c.send.Seal(out, nonce[:], plaintext, nil)
 	return out, nil
 }
 
-// decrypt unwraps [nonce][ciphertext(seq || plaintext)], verifies
-// integrity and enforces strict in-order delivery: replays and gaps
-// (a lost frame) are fatal errors, because a reliable ordered carrier
-// must not exhibit either.
+// decrypt unwraps [8-byte seq][ciphertext], verifies integrity and
+// enforces strict in-order delivery: replays and gaps (a lost frame)
+// are fatal errors, because a reliable ordered carrier must not
+// exhibit either.
 func (c *sessionCrypto) decrypt(data []byte) ([]byte, error) {
-	if len(data) < nonceSize+chacha20poly1305.Overhead+8 {
+	if len(data) < 8+chacha20poly1305.Overhead {
 		return nil, errors.New("session: ciphertext too short")
 	}
-	plain, err := c.recv.Open(nil, data[:nonceSize], data[nonceSize:], nil)
-	if err != nil {
-		return nil, err
-	}
-	seq := binary.BigEndian.Uint64(plain[:8])
+	seq := binary.BigEndian.Uint64(data[:8])
+	// Ordering first: cheaply rejects replays/gaps before AEAD work.
 	c.recvMu.Lock()
-	err = c.checkSeq(seq)
+	err := c.checkSeq(seq)
 	c.recvMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return plain[8:], nil
+	nonce := seqNonce(seq)
+	return c.recv.Open(nil, nonce[:], data[8:], nil)
 }
 
 // --- Key confirmation ---

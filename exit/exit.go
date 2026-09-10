@@ -22,10 +22,6 @@ type Server struct {
 	watchOnce sync.Once
 }
 
-// halfCloseGrace bounds how long relay waits for more client data after
-// the destination closed its side.
-const halfCloseGrace = 30 * time.Second
-
 func NewServer(m *mux.Mux) *Server {
 	return &Server{
 		mux:    m,
@@ -83,12 +79,23 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 	relay(conn, st)
 }
 
-// relay copies in both directions, propagating half-closes. When one
-// direction ends, the opposite read gets a grace deadline so a peer
-// holding its side open forever cannot leak the goroutine and the FD.
+// relay copies in both directions with true TCP half-close semantics:
+// HALF_CLOSE never kills the opposite direction (a server may think for
+// a long time before answering). If the stream dies (session lost,
+// peer CLOSE), the destination connection is force-closed so both copy
+// goroutines terminate and the FD is released.
 func relay(conn net.Conn, st *mux.Stream) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-st.Done():
+			conn.Close() // unblock both io.Copies
+		case <-done:
+		}
+	}()
 
 	go func() {
 		defer wg.Done()
@@ -96,22 +103,16 @@ func relay(conn net.Conn, st *mux.Stream) {
 		// Client finished sending: propagate EOF to the destination.
 		if tc, ok := conn.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
-		} else {
-			conn.Close()
 		}
-		// If the destination never closes its side, wake the other
-		// goroutine's conn.Read after a grace period.
-		conn.SetReadDeadline(time.Now().Add(halfCloseGrace))
 	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(st, conn)
-		// Destination finished: propagate EOF to the client, but do not
-		// wait forever for a client that holds the connection half-open.
+		// Destination finished: propagate EOF to the client.
 		st.CloseWrite()
-		st.SetReadDeadline(time.Now().Add(halfCloseGrace))
 	}()
 
 	wg.Wait()
+	close(done)
 }

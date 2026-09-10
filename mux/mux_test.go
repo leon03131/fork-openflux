@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -283,11 +284,60 @@ func TestDeadlineWakesBlockedRead(t *testing.T) {
 
 	select {
 	case err := <-readDone:
-		if err == nil {
-			t.Fatal("expected timeout error")
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("blocked Read ignored SetReadDeadline")
+	}
+}
+
+func TestSetDeadlineWakesBothDirections(t *testing.T) {
+	cm, sm := newMuxPair(t)
+
+	// Server accepts but never sends anything (client Read will block)
+	// and never reads (client Write will block on zero window).
+	go func() {
+		for {
+			st, err := sm.Accept()
+			if err != nil {
+				return
+			}
+			st.AcceptOpen()
+		}
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	// Exhaust the send window so Write blocks.
+	st.mu.Lock()
+	st.sendWindow = 0
+	st.mu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		st.Read(make([]byte, 1)) // blocks: no data
+	}()
+	go func() {
+		defer wg.Done()
+		st.Write([]byte("x")) // blocks: no window
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let both block
+	st.SetDeadline(time.Now().Add(200 * time.Millisecond))
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetDeadline did not wake both Read and Write")
 	}
 }
 

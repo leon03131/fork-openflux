@@ -239,8 +239,34 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 		t.session = session
-		t.SetConnected(true)
 		t.Mu.Unlock()
+
+		// Auth must complete BEFORE we report Connected: Ready means the
+		// provider transport can actually carry application payload.
+		tokenJSON, _ := json.Marshal(info.Token)
+		auth1 := fmt.Sprintf(`40{"token":%s}`, tokenJSON)
+		if err := session.safeWrite(websocket.TextMessage, []byte(auth1)); err != nil {
+			utils.Debugf("[YDOCS] auth write failed: %v", err)
+			conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
+
+		authData := map[string]interface{}{
+			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
+			"user": map[string]interface{}{"id": userID}, "editorType": 0,
+			"lastOtherSaveTime": -1, "permissions": info.Permissions,
+			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
+		}
+		messagePart, _ := json.Marshal([]interface{}{"message", authData})
+		if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
+			utils.Debugf("[YDOCS] auth write failed: %v", err)
+			conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
+
+		t.SetConnected(true)
 
 		// Close the superseded connection AFTER the new session is
 		// installed: its read loop will error out, see it is no longer
@@ -250,20 +276,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		} else {
 			go t.writerLoop()
 		}
-
-		// Auth - use safeWrite
-		tokenJSON, _ := json.Marshal(info.Token)
-		auth1 := fmt.Sprintf(`40{"token":%s}`, tokenJSON)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
-
-		authData := map[string]interface{}{
-			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
-			"user": map[string]interface{}{"id": userID}, "editorType": 0,
-			"lastOtherSaveTime": -1, "permissions": info.Permissions,
-			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
-		}
-		messagePart, _ := json.Marshal([]interface{}{"message", authData})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
 		establishedAt := time.Now()
 

@@ -74,9 +74,10 @@ OpenFlux has two protocol modes:
   sockets (exit node needs root; **Linux/macOS only** — Windows raw sockets
   are restricted by the OS; legacy also resolves DNS on the client side).
 
-v2 **requires** a pre-shared key (`--psk` / `OPENFLUX_PSK`). Use a random
-key of at least 16 bytes, e.g. `openssl rand -base64 24`. The `--insecure`
-flag disables encryption for local testing only.
+v2 **requires** a pre-shared key (`--psk` / `OPENFLUX_PSK`) — a 32-byte
+random key in base64 or hex form. Generate one with `openssl rand -base64 32`.
+Passphrases are rejected (they are offline-bruteforceable). The
+`--insecure` flag disables encryption for local testing only.
 
 ### v2 quickstart (recommended)
 
