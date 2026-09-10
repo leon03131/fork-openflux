@@ -40,7 +40,13 @@ var (
 	ErrNotConnected   = errors.New("session: transport not connected")
 	ErrHandshake      = errors.New("session: handshake failed")
 	ErrDeadConnection = errors.New("session: keepalive timeout")
+	ErrPeerReset      = errors.New("session: peer restarted its session")
+	ErrRoleConflict   = errors.New("session: both peers have the same role")
 )
+
+// sendQueueSize bounds the outbound frame queue feeding the writer
+// goroutine. A full queue applies backpressure to SendFrame callers.
+const sendQueueSize = 256
 
 // payloadCapacitor is an optional Transport extension for carriers that
 // know their payload budget.
@@ -63,7 +69,10 @@ type Session struct {
 	handler   func(wire.Frame)
 	handlerMu sync.RWMutex
 
-	sendMu sync.Mutex // frame ordering on the wire
+	// sendQueue feeds the single writer goroutine; this keeps the
+	// inbound dispatch path non-blocking even when the carrier write
+	// stalls (no lock is ever held across a network write).
+	sendQueue chan []byte
 
 	lastRecvNano atomic.Int64
 	closed       chan struct{}
@@ -81,11 +90,15 @@ func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 	if pc, ok := t.(payloadCapacitor); ok && pc.MaxPayload() > 0 {
 		maxP = pc.MaxPayload()
 	}
+	if len(psk) == 0 {
+		psk = nil // empty PSK means crypto off, not "empty key"
+	}
 	s := &Session{
 		trans:      t,
 		maxPayload: maxP,
 		psk:        psk,
 		isClient:   isClient,
+		sendQueue:  make(chan []byte, sendQueueSize),
 		closed:     make(chan struct{}),
 		helloCh:    make(chan error, 1),
 	}
@@ -103,6 +116,9 @@ func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 	if s.frameBudget > wire.MaxPayload {
 		s.frameBudget = wire.MaxPayload
 	}
+	if s.frameBudget < 512 {
+		return nil, fmt.Errorf("session: carrier MaxPayload %d too small", maxP)
+	}
 	return s, nil
 }
 
@@ -118,6 +134,14 @@ func (s *Session) Start() error {
 		if c := s.crypto.Load(); c != nil {
 			plain, err := c.decrypt(msg)
 			if err != nil {
+				// A plaintext HELLO while crypto is on means the peer
+				// rebuilt its session from scratch: reset immediately
+				// instead of burning decrypt-failure budget.
+				if looksLikePlaintextHello(msg) {
+					utils.Debugf("[SESSION] plaintext HELLO over encrypted session: peer reset")
+					s.CloseWithError(ErrPeerReset)
+					return
+				}
 				n := c.consecutiveFailures.Add(1)
 				utils.Debugf("[SESSION] decrypt failed (%d): %v", n, err)
 				if n >= maxDecryptFailures {
@@ -136,8 +160,33 @@ func (s *Session) Start() error {
 		s.lastRecvNano.Store(time.Now().UnixNano())
 		s.dispatch(f)
 	})
+	go s.writerLoop()
 	go s.keepaliveLoop()
 	return nil
+}
+
+// looksLikePlaintextHello reports whether msg is an unencrypted v2 HELLO
+// frame (magic + version + type).
+func looksLikePlaintextHello(msg []byte) bool {
+	return len(msg) >= wire.HeaderSize+1 &&
+		msg[0] == wire.Magic0 && msg[1] == wire.Magic1 &&
+		msg[2] == wire.Version && msg[3] == wire.TypeHello
+}
+
+// writerLoop is the ONLY goroutine that calls trans.Send. Keeping network
+// writes off the dispatch path prevents the "write stalls -> dispatch
+// blocks -> peer stops reading" deadlock cycle.
+func (s *Session) writerLoop() {
+	for {
+		select {
+		case msg := <-s.sendQueue:
+			if err := s.trans.Send(msg); err != nil {
+				utils.Debugf("[SESSION] transport send failed: %v", err)
+			}
+		case <-s.closed:
+			return
+		}
+	}
 }
 
 // waitConnected blocks until the carrier reports connectivity.
@@ -163,15 +212,21 @@ func (s *Session) Handshake() error {
 	if err := s.waitConnected(HelloTimeout); err != nil {
 		return fmt.Errorf("%w: %v", ErrHandshake, err)
 	}
-	var payload []byte
-	if s.psk != nil {
-		payload = s.priv.PublicKey().Bytes() // 32-byte ephemeral X25519 key
-	} else {
-		payload = make([]byte, 8)
-		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
-	}
-	if err := s.SendFrame(wire.Frame{Type: wire.TypeHello, Payload: payload}); err != nil {
-		return fmt.Errorf("%w: send hello: %v", ErrHandshake, err)
+	// Asymmetric handshake: only the client sends HELLO; the exit side
+	// waits for it (its dispatch completes the handshake). This avoids
+	// stray plaintext HELLO frames racing with crypto activation.
+	if s.isClient {
+		var payload []byte
+		if s.psk != nil {
+			// [role byte][32-byte ephemeral X25519 public key]
+			payload = append([]byte{roleByte(true)}, s.priv.PublicKey().Bytes()...)
+		} else {
+			payload = make([]byte, 8)
+			binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
+		}
+		if err := s.SendFrame(wire.Frame{Type: wire.TypeHello, Payload: payload}); err != nil {
+			return fmt.Errorf("%w: send hello: %v", ErrHandshake, err)
+		}
 	}
 	select {
 	case err := <-s.helloCh:
@@ -183,10 +238,23 @@ func (s *Session) Handshake() error {
 	case <-s.closed:
 		return ErrClosed
 	}
+	if s.psk != nil {
+		// Encrypted immediately: proves our keys to the peer at once.
+		ping := make([]byte, 8)
+		binary.BigEndian.PutUint64(ping, uint64(time.Now().UnixNano()))
+		s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping})
+	}
 	// From now on, loss of carrier connectivity kills the session; the
 	// supervisor builds a fresh one over the reconnected carrier.
 	go s.watchdog()
 	return nil
+}
+
+func roleByte(isClient bool) byte {
+	if isClient {
+		return 1
+	}
+	return 0
 }
 
 // watchdog closes the session when the carrier drops. Keepalive
@@ -211,15 +279,42 @@ func (s *Session) watchdog() {
 func (s *Session) dispatch(f wire.Frame) {
 	switch f.Type {
 	case wire.TypeHello:
-		// In secure mode the payload is the peer's ephemeral public key:
-		// derive keys, then reply with our key BEFORE enabling crypto.
-		if s.psk != nil && s.crypto.Load() == nil {
-			c, err := deriveSession(s.psk, s.priv, f.Payload, s.isClient)
+		// Roles are asymmetric in the handshake: only the client sends
+		// HELLO; the exit side answers with HELLO_ACK; the client
+		// completes the handshake by verifying the key-confirmation tag.
+		if s.isClient {
+			return
+		}
+		// A valid encrypted HELLO arriving after the handshake means the
+		// peer restarted its session over the same carrier.
+		if s.psk != nil && s.crypto.Load() != nil {
+			utils.Debugf("[SESSION] HELLO over established session: peer reset")
+			s.CloseWithError(ErrPeerReset)
+			return
+		}
+		if s.psk != nil {
+			// Payload: [role byte][32-byte ephemeral X25519 public key].
+			if len(f.Payload) != 33 {
+				s.failHello(fmt.Errorf("bad HELLO length %d", len(f.Payload)))
+				return
+			}
+			if f.Payload[0] == roleByte(s.isClient) {
+				s.failHello(ErrRoleConflict)
+				return
+			}
+			peerPub := f.Payload[1:]
+			c, err := deriveSession(s.psk, s.priv, peerPub, s.isClient)
 			if err != nil {
 				s.failHello(err)
 				return
 			}
-			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: s.priv.PublicKey().Bytes()})
+			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
+			tag := c.computeKeyConfirm(clientPub, serverPub)
+			ackPayload := append(append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...), tag...)
+			// HELLO_ACK must leave in plaintext: the client derives keys
+			// from it. Enqueued before crypto is enabled, and the writer
+			// preserves order.
+			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: ackPayload})
 			s.crypto.Store(c)
 		} else {
 			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: f.Payload})
@@ -229,10 +324,31 @@ func (s *Session) dispatch(f wire.Frame) {
 		default:
 		}
 	case wire.TypeHelloAck:
-		if s.psk != nil && s.crypto.Load() == nil {
-			c, err := deriveSession(s.psk, s.priv, f.Payload, s.isClient)
+		if !s.isClient {
+			return // the exit side does not expect HELLO_ACK
+		}
+		if s.psk != nil {
+			if s.crypto.Load() != nil {
+				return // duplicate HELLO_ACK
+			}
+			// [role][server pubkey][key confirmation tag]
+			if len(f.Payload) != 1+32+keyConfirmTagLen {
+				s.failHello(fmt.Errorf("bad HELLO_ACK length %d", len(f.Payload)))
+				return
+			}
+			if f.Payload[0] == roleByte(s.isClient) {
+				s.failHello(ErrRoleConflict)
+				return
+			}
+			peerPub := f.Payload[1:33]
+			c, err := deriveSession(s.psk, s.priv, peerPub, s.isClient)
 			if err != nil {
 				s.failHello(err)
+				return
+			}
+			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
+			if !c.verifyKeyConfirm(clientPub, serverPub, f.Payload[33:]) {
+				s.failHello(errors.New("key confirmation failed (PSK mismatch?)"))
 				return
 			}
 			s.crypto.Store(c)
@@ -278,15 +394,20 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	if err != nil {
 		return err
 	}
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
 	if c := s.crypto.Load(); c != nil {
 		buf, err = c.encrypt(buf)
 		if err != nil {
 			return err
 		}
 	}
-	return s.trans.Send(buf)
+	// Enqueue for the writer goroutine. Blocks (applying backpressure)
+	// when the carrier is saturated; unblocks with ErrClosed on Close.
+	select {
+	case s.sendQueue <- buf:
+		return nil
+	case <-s.closed:
+		return ErrClosed
+	}
 }
 
 func (s *Session) failHello(err error) {
@@ -294,6 +415,14 @@ func (s *Session) failHello(err error) {
 	case s.helloCh <- fmt.Errorf("%w: %v", ErrHandshake, err):
 	default:
 	}
+}
+
+// orderPubs returns (clientPub, serverPub) given our and the peer's keys.
+func orderPubs(ourPub, peerPub []byte, isClient bool) ([]byte, []byte) {
+	if isClient {
+		return ourPub, peerPub
+	}
+	return peerPub, ourPub
 }
 
 func (s *Session) keepaliveLoop() {

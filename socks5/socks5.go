@@ -214,22 +214,31 @@ func (s *SOCKS5Server) negotiate(conn net.Conn) (target string, replyCode byte, 
 
 // dialWithTimeout bounds the dial: gonet.DialTCP has no connect timeout of
 // its own, so a dead route would otherwise hang the handshake forever.
-// Note: on timeout the abandoned dial goroutine may linger inside the
-// network stack until its own retransmission timeout expires.
+// A dial that completes AFTER the timeout has its connection closed.
 func (s *SOCKS5Server) dialWithTimeout(address string) (net.Conn, error) {
 	type result struct {
 		conn net.Conn
 		err  error
 	}
 	ch := make(chan result, 1)
+	abandoned := make(chan struct{})
 	go func() {
 		conn, err := s.dialer.DialTCP(address)
-		ch <- result{conn, err}
+		select {
+		case ch <- result{conn, err}:
+		case <-abandoned:
+			// The caller timed out; do not leak a successfully dialed
+			// connection.
+			if conn != nil {
+				conn.Close()
+			}
+		}
 	}()
 	select {
 	case r := <-ch:
 		return r.conn, r.err
 	case <-time.After(dialTimeout):
+		close(abandoned)
 		return nil, fmt.Errorf("dial %s: timeout", address)
 	}
 }

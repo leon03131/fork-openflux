@@ -19,6 +19,7 @@ func NewMaxClient() *MaxClient {
 	return &MaxClient{
 		deviceID:      genUUID(),
 		keepaliveStop: make(chan struct{}),
+		closedCh:      make(chan struct{}),
 	}
 }
 
@@ -45,6 +46,7 @@ func (c *MaxClient) readLoop() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			logError("[MAX] connection lost: %v", err)
+			c.dead.Store(true)
 			return
 		}
 		var packet MaxPacket
@@ -60,6 +62,9 @@ func (c *MaxClient) readLoop() {
 }
 
 func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPacket, error) {
+	if c.dead.Load() {
+		return nil, fmt.Errorf("main connection is dead")
+	}
 	seq := c.seq.Add(1)
 	req := map[string]interface{}{"ver": RPC_VERSION, "cmd": 0, "seq": seq, "opcode": opcode, "payload": payload}
 	data, _ := json.Marshal(req)
@@ -109,10 +114,58 @@ func (c *MaxClient) LoginByToken(token string) error {
 	return nil
 }
 
+// Supervise keeps the main websocket connection alive: when readLoop
+// dies, it reconnects and re-logs-in with backoff until Close.
+// The event callback (set via SetEventCallback) survives reconnects.
+func (c *MaxClient) Supervise(token string) {
+	for {
+		select {
+		case <-c.closedCh:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		if !c.dead.Load() {
+			continue
+		}
+		logInfo("[MAX] reconnecting main websocket...")
+		c.mu.Lock()
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
+		c.mu.Unlock()
+		if err := c.Connect(); err != nil {
+			logError("[MAX] reconnect failed: %v", err)
+			continue
+		}
+		if err := c.LoginByToken(token); err != nil {
+			logError("[MAX] re-login failed: %v", err)
+			continue
+		}
+		c.dead.Store(false)
+		logInfo("[MAX] reconnected")
+	}
+}
+
+// Close terminates the client and all its goroutines.
+func (c *MaxClient) Close() {
+	c.closeOnce.Do(func() {
+		close(c.keepaliveStop)
+		close(c.closedCh)
+		c.mu.Lock()
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
+		c.mu.Unlock()
+	})
+}
+
 // Check verifies MAX connectivity and credentials (used by
 // `openflux doctor`).
 func Check(token string) error {
 	c := NewMaxClient()
+	defer c.Close()
 	if err := c.Connect(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}

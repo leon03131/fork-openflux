@@ -55,6 +55,12 @@ func (t *OneMeTransport) Start() error {
 	t.ch.onStateChange = func(connected bool) {
 		t.b.SetConnected(connected)
 	}
+	// Sync the initial state: the callback may have missed an early
+	// transition fired before it was assigned.
+	t.b.SetConnected(t.ch.connected.Load())
+
+	// Keep the main MAX websocket alive across drops.
+	go t.oneMeClient.Supervise(t.token)
 
 	utils.Debugf("configured dc inbound")
 	t.ch.dcInbound = func(data []byte) {
@@ -66,7 +72,21 @@ func (t *OneMeTransport) Start() error {
 }
 
 func (t *OneMeTransport) Stop() error {
-	return t.b.Stop()
+	if err := t.b.Stop(); err != nil {
+		return err
+	}
+	if t.oneMeClient != nil {
+		t.oneMeClient.Close()
+	}
+	if t.ch != nil {
+		t.ch.mu.Lock()
+		if t.ch.conn != nil {
+			t.ch.conn.Close()
+			t.ch.conn = nil
+		}
+		t.ch.mu.Unlock()
+	}
+	return nil
 }
 
 func (t *OneMeTransport) IsConnected() bool {

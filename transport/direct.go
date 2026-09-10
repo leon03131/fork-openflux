@@ -28,6 +28,7 @@ type DirectTransport struct {
 	listener net.Listener
 	conn     net.Conn
 	doneCh   chan struct{}
+	started  bool
 }
 
 func NewDirectTransport(addr string, isExit bool, config TransportConfig) *DirectTransport {
@@ -40,6 +41,14 @@ func NewDirectTransport(addr string, isExit bool, config TransportConfig) *Direc
 }
 
 func (t *DirectTransport) Start() error {
+	t.mu.Lock()
+	if t.started {
+		t.mu.Unlock()
+		return errors.New("direct: already started")
+	}
+	t.started = true
+	t.mu.Unlock()
+
 	if err := t.BaseTransport.Start(); err != nil {
 		return err
 	}
@@ -73,20 +82,37 @@ func (t *DirectTransport) acceptLoop(listener net.Listener) {
 }
 
 func (t *DirectTransport) dialLoop() {
+	first := true
 	for t.IsRunning() {
-		conn, err := net.DialTimeout("tcp", t.addr, 10*1e9)
+		if !first {
+			t.RecordReconnect()
+		}
+		first = false
+		conn, err := net.DialTimeout("tcp", t.addr, 10*time.Second)
 		if err != nil {
 			utils.Debugf("[DIRECT] dial error: %v", err)
 			t.sleepBeforeRetry()
 			continue
 		}
-		t.setConn(conn)
+		if !t.setConn(conn) {
+			return // stopped while dialing
+		}
 		t.readLoop(conn) // blocks until connection dies
+		// Back off after a dead connection too, so a bouncing peer
+		// (or two clients fighting) does not cause a reconnect storm.
+		t.sleepBeforeRetry()
 	}
 }
 
-func (t *DirectTransport) setConn(conn net.Conn) {
+// setConn installs the connection. Returns false if the transport was
+// stopped meanwhile (the caller must not proceed to readLoop).
+func (t *DirectTransport) setConn(conn net.Conn) bool {
 	t.mu.Lock()
+	if !t.IsRunning() {
+		t.mu.Unlock()
+		conn.Close()
+		return false
+	}
 	if t.conn != nil {
 		t.conn.Close()
 	}
@@ -94,6 +120,7 @@ func (t *DirectTransport) setConn(conn net.Conn) {
 	t.mu.Unlock()
 	t.SetConnected(true)
 	utils.Debugf("[DIRECT] connection established: %s", conn.RemoteAddr())
+	return true
 }
 
 func (t *DirectTransport) readLoop(conn net.Conn) {
@@ -164,7 +191,11 @@ func (t *DirectTransport) Send(data []byte) error {
 	frame := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(frame, uint32(len(data)))
 	copy(frame[4:], data)
-	if _, err := conn.Write(frame); err != nil {
+	// A wedged peer must not block the session writer forever.
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	_, err := conn.Write(frame)
+	conn.SetWriteDeadline(time.Time{})
+	if err != nil {
 		return fmt.Errorf("direct: write: %w", err)
 	}
 	t.RecordSend(len(data))

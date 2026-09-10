@@ -1,6 +1,7 @@
 package yandex
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -53,6 +54,43 @@ type YandexDocsTransport struct {
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	sentEcho dedupRing
+}
+
+// dedupRing is a small fixed-size ring of hashes of recently sent
+// payloads, used to drop our own cursor messages if the server echoes
+// them back to us (self-echo would otherwise corrupt the session).
+type dedupRing struct {
+	mu     sync.Mutex
+	hashes [64][32]byte
+	pos    int
+	filled bool
+}
+
+func (r *dedupRing) add(h [32]byte) {
+	r.mu.Lock()
+	r.hashes[r.pos] = h
+	r.pos = (r.pos + 1) % len(r.hashes)
+	if r.pos == 0 {
+		r.filled = true
+	}
+	r.mu.Unlock()
+}
+
+func (r *dedupRing) contains(h [32]byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := len(r.hashes)
+	if !r.filled {
+		n = r.pos
+	}
+	for i := 0; i < n; i++ {
+		if r.hashes[i] == h {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxPayload is the raw message budget for the Yandex Docs carrier.
@@ -159,13 +197,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		// Re-check after the blocking dial: Stop() may have been called
-		// while we were connecting.
-		if !t.IsRunning() {
-			conn.Close()
-			return
-		}
-
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
 			writeQueue = existingSession.WriteQueue
@@ -178,7 +209,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			UserID:     userID,
 		}
 
+		// Re-check under the same critical section that installs the
+		// session: Stop() may have fired during the blocking dial.
 		t.Mu.Lock()
+		if !t.IsRunning() {
+			t.Mu.Unlock()
+			conn.Close()
+			return
+		}
 		t.session = session
 		t.SetConnected(true)
 		t.Mu.Unlock()
@@ -247,6 +285,7 @@ func (t *YandexDocsTransport) writerLoop() {
 		select {
 		case packet := <-session.WriteQueue:
 			payload := base64.StdEncoding.EncodeToString(packet)
+			t.sentEcho.add(sha256.Sum256([]byte(payload)))
 			msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
 
 			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
@@ -272,6 +311,14 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
+				// Only the CURRENT session may trigger teardown; a stale
+				// session's failure must not mark the new one down.
+				t.Mu.RLock()
+				stale := t.session != session
+				t.Mu.RUnlock()
+				if stale {
+					continue
+				}
 				t.SetConnected(false)
 				// Kill the connection so the read loop wakes up and
 				// schedules a reconnect; otherwise the transport would
@@ -312,6 +359,11 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			return
 		}
 
+		// Drop our own messages echoed back by the server.
+		if t.sentEcho.contains(sha256.Sum256([]byte(base64Str))) {
+			return
+		}
+
 		t.RecordReceive(len(decoded))
 		t.CallReceive(decoded)
 	}
@@ -331,8 +383,7 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 		return response[left : left+right]
 	}
 
-	re := regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
+	matches := cursorRe.FindStringSubmatch(response)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -389,7 +440,11 @@ type clientConfigDoc struct {
 // maxConfigPageSize bounds the HTML page we parse (defense in depth).
 const maxConfigPageSize = 8 << 20 // 8 MiB
 
-var clientConfigRe = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+var (
+	// (?s): the embedded JSON may span newlines.
+	clientConfigRe = regexp.MustCompile(`(?s)<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+	cursorRe       = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
+)
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
 	client := &http.Client{

@@ -48,12 +48,11 @@ func (m *MemoryTransport) Start() error {
 }
 
 func (m *MemoryTransport) Stop() error {
-	if !m.IsRunning() {
+	// CompareAndSwap makes double-Stop (even concurrent) safe.
+	if !m.running.CompareAndSwap(1, 0) {
 		return nil
 	}
-	if err := m.BaseTransport.Stop(); err != nil {
-		return err
-	}
+	m.connected.Store(0)
 	close(m.done)
 	return nil
 }

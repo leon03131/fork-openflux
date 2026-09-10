@@ -80,6 +80,12 @@ func newMux(s *session.Session, firstID uint32) *Mux {
 		closed:   make(chan struct{}),
 	}
 	s.OnFrame(m.handleFrame)
+	// If the session dies, the mux must die too: wake all blocked
+	// Read/Write and fail Accept/Open.
+	go func() {
+		<-s.Closed()
+		m.Close()
+	}()
 	return m
 }
 
@@ -151,8 +157,9 @@ func (m *Mux) Accept() (*Stream, error) {
 
 func (m *Mux) Close() {
 	m.closeOnce.Do(func() {
+		// GOAWAY first: once m.closed is closed, send() refuses to send.
+		m.sess.SendFrame(wire.Frame{Type: wire.TypeGoAway})
 		close(m.closed)
-		m.send(wire.Frame{Type: wire.TypeGoAway})
 		m.mu.Lock()
 		for _, st := range m.streams {
 			st.closeNoSend()
@@ -273,12 +280,18 @@ type Stream struct {
 
 	openCh chan error // buffered (1)
 
-	mu           sync.Mutex
-	recvBuf      bytes.Buffer
-	readEOF      bool // peer half-closed; drained reads return io.EOF
-	closed       bool
-	writeClosed  bool
-	sendWindow   int
+	mu          sync.Mutex
+	recvBuf     bytes.Buffer
+	readEOF     bool // peer half-closed; drained reads return io.EOF
+	closed      bool
+	writeClosed bool
+	sendWindow  int
+	// pendingCredit is WINDOW_UPDATE credit we owe the peer because a
+	// previous WINDOW_UPDATE frame failed to send.
+	pendingCredit int
+	// recvUnacked bounds unread buffered data so a misbehaving peer
+	// cannot grow recvBuf without limit.
+	recvUnacked  int
 	peerNotified bool // we sent Close
 
 	recvNotify    chan struct{} // cap 1
@@ -332,16 +345,32 @@ func (s *Stream) openResult(err error) {
 
 func (s *Stream) feedData(payload []byte) {
 	s.mu.Lock()
-	if !s.closed {
-		s.recvBuf.Write(append([]byte(nil), payload...))
+	if s.closed {
+		s.mu.Unlock()
+		return
 	}
+	// Flow control enforcement: the peer may legally have up to
+	// DefaultWindowSize unacked bytes in flight. Allow one extra frame
+	// of slack, then treat excess as a protocol violation.
+	s.recvUnacked += len(payload)
+	if s.recvUnacked > DefaultWindowSize+s.m.sess.MaxFramePayload() {
+		s.mu.Unlock()
+		utils.Debugf("[MUX] stream %d exceeded receive window, resetting", s.id)
+		s.Close()
+		return
+	}
+	s.recvBuf.Write(append([]byte(nil), payload...))
 	s.mu.Unlock()
 	notify(s.recvNotify)
 }
 
 func (s *Stream) addSendWindow(n int) {
 	s.mu.Lock()
+	// Cap at the negotiated window: the peer must not inflate it.
 	s.sendWindow += n
+	if s.sendWindow > DefaultWindowSize {
+		s.sendWindow = DefaultWindowSize
+	}
 	s.mu.Unlock()
 	notify(s.sendNotify)
 }
@@ -381,13 +410,24 @@ func notify(ch chan struct{}) {
 }
 
 func (s *Stream) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	for {
 		s.mu.Lock()
 		if s.recvBuf.Len() > 0 {
 			n, _ := s.recvBuf.Read(b)
+			s.recvUnacked -= n
+			credit := n + s.pendingCredit
+			s.pendingCredit = 0
 			s.mu.Unlock()
-			// Grant the consumed bytes back to the peer.
-			s.m.send(wire.Frame{Type: wire.TypeWindowUpdate, StreamID: s.id, Payload: uint32Bytes(uint32(n))})
+			// Grant the consumed bytes back to the peer. If the update
+			// fails to send, remember the credit instead of losing it.
+			if err := s.m.send(wire.Frame{Type: wire.TypeWindowUpdate, StreamID: s.id, Payload: uint32Bytes(uint32(credit))}); err != nil {
+				s.mu.Lock()
+				s.pendingCredit += credit
+				s.mu.Unlock()
+			}
 			return n, nil
 		}
 		if s.readEOF {
@@ -452,6 +492,11 @@ func (s *Stream) Write(b []byte) (int, error) {
 
 		err := s.m.send(wire.Frame{Type: wire.TypeData, StreamID: s.id, Payload: b[total : total+n]})
 		if err != nil {
+			// The frame was not sent: return the credit so the window
+			// accounting does not leak.
+			s.mu.Lock()
+			s.sendWindow += n
+			s.mu.Unlock()
 			return total, err
 		}
 		total += n

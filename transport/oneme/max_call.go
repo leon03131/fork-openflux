@@ -91,13 +91,19 @@ func (h *CallHandler) readLoop(conn *websocket.Conn) {
 			continue
 		}
 
-		// Handlers mutate shared state and may block; run them
-		// serialized so they never race each other.
-		go func() {
-			h.msgMu.Lock()
-			defer h.msgMu.Unlock()
-			h.msgHandler(text)
-		}()
+		// Ordered FIFO dispatch: handlers may mutate state and block,
+		// and data frames must keep their arrival order.
+		h.msgCh <- text
+	}
+}
+
+// dispatchLoop is the single consumer of signaling messages, keeping
+// strict FIFO order. Started once per CallHandler.
+func (h *CallHandler) dispatchLoop() {
+	for text := range h.msgCh {
+		h.msgMu.Lock()
+		h.msgHandler(text)
+		h.msgMu.Unlock()
 	}
 }
 
@@ -136,21 +142,39 @@ func (h *CallHandler) sendAcceptCall() {
 	logInfo("[%s] Accept-call sent", h.tag)
 }
 
-// resetCallState clears all per-call state. Caller must hold h.msgMu.
+// resetCallState clears all per-call state. Caller must hold h.msgMu
+// (this guarantees no handler is executing and the queue drain below
+// cannot race with dispatch).
 func (h *CallHandler) resetCallState() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.callAccepted.Store(false)
 	h.acceptSent.Store(false)
 	h.hasRemoteDesc = false
 	h.pendingCandidates = nil
 	h.localID = 0
 	h.seq = 1
+	if h.conn != nil {
+		h.conn.Close()
+		h.conn = nil
+	}
 	if h.pc != nil {
-		h.pc.Close()
+		old := h.pc
 		h.pc = nil
+		h.mu.Unlock()
+		old.Close() // pion callbacks may need h.mu; do not hold it
+		h.mu.Lock()
 	}
 	h.dc = nil
+	h.mu.Unlock()
+
+	// Drop messages queued by the previous connection.
+	for {
+		select {
+		case <-h.msgCh:
+		default:
+			return
+		}
+	}
 }
 
 func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
@@ -462,6 +486,8 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h := &CallHandler{tag: "CALLER", role: "caller"}
 	h.seq = 1
 	h.reconnectCh = make(chan struct{}, 1)
+	h.msgCh = make(chan string, 1024)
+	go h.dispatchLoop()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -570,6 +596,8 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 func startIncomingListener(client *MaxClient) *CallHandler {
 	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
 	h.seq = 1
+	h.msgCh = make(chan string, 1024)
+	go h.dispatchLoop()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)

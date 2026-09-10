@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -127,6 +128,8 @@ func FrameLen(data []byte) (int, error) {
 // EncodeAddress encodes host:port into the OPEN payload form.
 // host may be an IPv4, IPv6 or a domain name.
 func EncodeAddress(host string, port uint16) ([]byte, error) {
+	// Tolerate bracketed IPv6 forms on input.
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
 	if ip := net.ParseIP(host); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
 			out := make([]byte, 1+4+2)
@@ -184,7 +187,8 @@ func DecodeAddress(data []byte) (host string, port uint16, err error) {
 		if len(data) != 1+16+2 {
 			return "", 0, ErrBadAddress
 		}
-		host = "[" + net.IP(data[1:17]).String() + "]"
+		// Bare address, no brackets: JoinHostPort adds them when needed.
+		host = net.IP(data[1:17]).String()
 		port = binary.BigEndian.Uint16(data[17:19])
 	default:
 		return "", 0, fmt.Errorf("%w: unknown atyp %#x", ErrBadAddress, data[0])

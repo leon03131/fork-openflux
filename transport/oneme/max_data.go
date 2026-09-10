@@ -49,7 +49,10 @@ type MaxClient struct {
 	pending       sync.Map
 	deviceID      string
 	loggedIn      bool
+	dead          atomic.Bool
 	keepaliveStop chan struct{}
+	closedCh      chan struct{}
+	closeOnce     sync.Once
 	onEvent       func(MaxPacket)
 }
 
@@ -72,7 +75,10 @@ type CallHandler struct {
 	onStateChange     func(bool)
 	// mu guards conn, pc, dc, localID and seq.
 	mu sync.Mutex
-	// msgMu serializes signaling message handlers (they are dispatched
-	// as goroutines from the read loop).
+	// msgCh feeds the single dispatcher goroutine: signaling messages
+	// are handled strictly in arrival order (data integrity depends on
+	// it in ICE-injection mode).
+	msgCh chan string
+	// msgMu serializes msgHandler against resetCallState.
 	msgMu sync.Mutex
 }

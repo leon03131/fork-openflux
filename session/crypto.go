@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/rand"
@@ -30,6 +31,9 @@ const (
 	nonceSize    = chacha20poly1305.NonceSize
 	keySize      = chacha20poly1305.KeySize
 	aeadOverhead = nonceSize + chacha20poly1305.Overhead
+
+	// keyConfirmTagLen = len("OPENFLUX-KC") + 64 pub bytes + AEAD tag.
+	keyConfirmTagLen = 11 + 64 + chacha20poly1305.Overhead
 )
 
 // ErrCryptoMismatch indicates the peer failed to decrypt repeatedly —
@@ -126,4 +130,38 @@ func (c *sessionCrypto) decrypt(data []byte) ([]byte, error) {
 		return nil, errors.New("session: ciphertext too short")
 	}
 	return c.recv.Open(nil, data[:nonceSize], data[nonceSize:], nil)
+}
+
+// --- Key confirmation ---
+//
+// HELLO_ACK carries an AEAD tag over a constant bound to both ephemeral
+// public keys. Verifying it proves the peer derived the same keys, i.e.
+// knows the PSK. A fixed zero nonce is safe here: the tag is computed
+// exactly once per session key (random stream nonces are 96-bit, so an
+// accidental collision with the all-zero nonce is negligible).
+
+var keyConfirmNonce = make([]byte, nonceSize)
+
+func keyConfirmMessage(clientPub, serverPub []byte) []byte {
+	msg := make([]byte, 0, len("OPENFLUX-KC")+64)
+	msg = append(msg, "OPENFLUX-KC"...)
+	msg = append(msg, clientPub...)
+	msg = append(msg, serverPub...)
+	return msg
+}
+
+// computeKeyConfirm produces the tag with the SEND key (caller: the side
+// answering HELLO).
+func (c *sessionCrypto) computeKeyConfirm(clientPub, serverPub []byte) []byte {
+	return c.send.Seal(nil, keyConfirmNonce, keyConfirmMessage(clientPub, serverPub), nil)
+}
+
+// verifyKeyConfirm checks the tag with the RECV key (caller: the side
+// that sent HELLO).
+func (c *sessionCrypto) verifyKeyConfirm(clientPub, serverPub, tag []byte) bool {
+	plain, err := c.recv.Open(nil, keyConfirmNonce, tag, nil)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(plain, keyConfirmMessage(clientPub, serverPub))
 }

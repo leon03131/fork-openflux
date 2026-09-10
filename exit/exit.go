@@ -17,9 +17,14 @@ import (
 )
 
 type Server struct {
-	mux    *mux.Mux
-	dialer net.Dialer
+	mux       *mux.Mux
+	dialer    net.Dialer
+	watchOnce sync.Once
 }
+
+// halfCloseGrace bounds how long relay waits for more client data after
+// the destination closed its side.
+const halfCloseGrace = 30 * time.Second
 
 func NewServer(m *mux.Mux) *Server {
 	return &Server{
@@ -29,14 +34,22 @@ func NewServer(m *mux.Mux) *Server {
 }
 
 // Serve accepts streams until the mux is closed or ctx is cancelled.
+// The ctx watcher is registered once per Server, not per call, so
+// repeated Serve calls (session rebuilds) do not leak goroutines.
 func (s *Server) Serve(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
-		s.mux.Close()
-	}()
+	s.watchOnce.Do(func() {
+		go func() {
+			<-ctx.Done()
+			s.mux.Close()
+		}()
+	})
 	for {
 		st, err := s.mux.Accept()
 		if err != nil {
+			// Mux closed during graceful shutdown is not an error.
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		go s.handle(ctx, st)
@@ -82,8 +95,10 @@ func relay(conn net.Conn, st *mux.Stream) {
 	go func() {
 		defer wg.Done()
 		io.Copy(st, conn)
-		// Destination finished: propagate EOF to the client.
+		// Destination finished: propagate EOF to the client, but do not
+		// wait forever for a client that holds the connection half-open.
 		st.CloseWrite()
+		st.SetReadDeadline(time.Now().Add(halfCloseGrace))
 	}()
 
 	wg.Wait()

@@ -9,12 +9,20 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
+// maxVCPSize bounds the decompressed call-details blob (untrusted input).
+const maxVCPSize = 1 << 20 // 1 MiB
+
 func decodeCallDetails(vcp string) (string, error) {
 	if len(vcp) < 4 {
 		return "", fmt.Errorf("vcp too short")
 	}
 	var size int
-	fmt.Sscanf(vcp[:3], "%d", &size)
+	if _, err := fmt.Sscanf(vcp[:3], "%d", &size); err != nil {
+		return "", fmt.Errorf("bad vcp size: %w", err)
+	}
+	if size <= 0 || size > maxVCPSize {
+		return "", fmt.Errorf("bad vcp size %d", size)
+	}
 	decoded, err := base64.StdEncoding.DecodeString(vcp[4:])
 	if err != nil {
 		return "", err

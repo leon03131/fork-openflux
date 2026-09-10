@@ -3,6 +3,8 @@ package wire
 import (
 	"bytes"
 	"errors"
+	"net"
+	"strings"
 	"testing"
 )
 
@@ -95,13 +97,16 @@ func TestAddressRoundtrip(t *testing.T) {
 		if port != c.port {
 			t.Fatalf("%s: port %d != %d", c.host, port, c.port)
 		}
-		// Normalize IPv6 brackets for comparison.
-		want := c.host
-		if host[0] == '[' && want[0] != '[' {
-			want = "[" + want + "]"
+		if host != c.host {
+			t.Fatalf("host %q != %q", host, c.host)
 		}
-		if host != want {
-			t.Fatalf("host %q != %q", host, want)
+		// The full chain used by the exit node must produce a dialable address.
+		dial := JoinHostPort(host, port)
+		if strings.Contains(dial, "[[") {
+			t.Fatalf("double brackets in dial address: %q", dial)
+		}
+		if _, err := net.ResolveTCPAddr("tcp", dial); err != nil {
+			t.Fatalf("address %q not dialable: %v", dial, err)
 		}
 	}
 }

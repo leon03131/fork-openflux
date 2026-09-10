@@ -62,7 +62,6 @@ Legacy flag style also works: openflux --client / --exit-node
 
 Flags:
 `, Version)
-	flag.CommandLine.SetOutput(os.Stderr)
 	flag.PrintDefaults()
 }
 
@@ -87,9 +86,14 @@ func run() error {
 	flag.StringVar(&cfg.maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	flag.StringVar(&cfg.addr, "addr", "", "Address for direct transport (client: exit address; exit: listen address)")
 	flag.StringVar(&cfg.psk, "psk", "", "Pre-shared key for v2 encryption (or env OPENFLUX_PSK)")
+	flag.CommandLine.Usage = usage
 	// NOTE: parse the sliced args, not os.Args, so subcommands work.
 	if err := flag.CommandLine.Parse(args); err != nil {
 		return err
+	}
+	if flag.NArg() > 0 {
+		usage()
+		return fmt.Errorf("unexpected arguments: %v", flag.Args())
 	}
 
 	switch cmd {
@@ -347,6 +351,13 @@ func runDoctor(cfg *cliConfig) error {
 			check("--maxToken present", flagMissing("not set"))
 		} else {
 			check("--maxToken present", nil)
+		}
+		if _, err := strconv.ParseInt(cfg.maxUid, 10, 64); err != nil {
+			check("--maxUid valid", fmt.Errorf("%v", err))
+		} else {
+			check("--maxUid valid", nil)
+		}
+		if cfg.maxToken != "" {
 			check("max websocket + login", oneme.Check(cfg.maxToken))
 		}
 	case "direct":

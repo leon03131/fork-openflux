@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,24 +106,67 @@ func TestEncryptedSessionWireIsCiphertext(t *testing.T) {
 	}
 }
 
-func TestWrongPSKDies(t *testing.T) {
+func TestWrongPSKFailsHandshake(t *testing.T) {
 	sa, sb := newSessionPair(t, []byte("key-A"), []byte("key-B"))
-	handshakeBoth(t, sa, sb) // handshake itself is plaintext, succeeds
 
-	// Encrypted frames are undecryptable for the peer: after
-	// maxDecryptFailures the session must close.
+	// The client must fail fast at key confirmation.
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- sb.Handshake() }()
+
+	err := sa.Handshake()
+	if err == nil {
+		t.Fatal("client handshake succeeded with wrong PSK")
+	}
+	if !strings.Contains(err.Error(), "key confirmation") {
+		t.Fatalf("unexpected handshake error: %v", err)
+	}
+
+	// The server completes its handshake and stays up (it has no way to
+	// know the client had the wrong key until encrypted frames arrive).
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server handshake: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server handshake timeout")
+	}
+
+	// Sanity: a correct-PSK pair still works (covered by other tests).
+	sa.Close()
+	sb.Close()
+}
+
+func TestUndecryptableFramesKillSession(t *testing.T) {
+	sa, sb := newSessionPair(t, []byte("key-A"), []byte("key-A"))
+	handshakeBoth(t, sa, sb)
+
+	// Forge ciphertext with a WRONG key set (simulates a carrier-level
+	// attacker or a corrupted peer) and inject it via the carrier.
+	priv, _ := generateEphemeralKey()
+	evil, err := deriveSession([]byte("wrong"), priv, priv.PublicKey().Bytes(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ta is sa's transport; sending raw bytes reaches sb's session.
+	ta := sa.trans
 	for i := 0; i < maxDecryptFailures; i++ {
-		if err := sa.SendFrame(wire.Frame{Type: wire.TypeData, StreamID: 1, Payload: []byte("x")}); err != nil {
+		blob, err := evil.encrypt([]byte("garbage"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ta.Send(blob); err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	select {
 	case <-sb.Closed():
 		if sb.Err() != ErrCryptoMismatch {
 			t.Fatalf("close reason = %v, want ErrCryptoMismatch", sb.Err())
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("session survived wrong PSK")
+		t.Fatal("session survived undecryptable frames")
 	}
 }
 
