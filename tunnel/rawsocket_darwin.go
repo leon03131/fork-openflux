@@ -12,8 +12,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
-	"universal-bypass-tool/network"
-	"universal-bypass-tool/utils"
+	"github.com/leon03131/fork-openflux/network"
+	"github.com/leon03131/fork-openflux/utils"
 )
 
 type RawSocketEndpoint struct {
@@ -200,22 +200,24 @@ func (e *RawSocketEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpi
 	return n, nil
 }
 
-func (e *RawSocketEndpoint) MTU() uint32                                 { return 1500 }
-func (e *RawSocketEndpoint) MaxHeaderLength() uint16                      { return 0 }
-func (e *RawSocketEndpoint) LinkAddress() tcpip.LinkAddress               { return "" }
-func (e *RawSocketEndpoint) Capabilities() stack.LinkEndpointCapabilities { return stack.CapabilityNone }
+func (e *RawSocketEndpoint) MTU() uint32                    { return 1500 }
+func (e *RawSocketEndpoint) MaxHeaderLength() uint16        { return 0 }
+func (e *RawSocketEndpoint) LinkAddress() tcpip.LinkAddress { return "" }
+func (e *RawSocketEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityNone
+}
 func (e *RawSocketEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	e.dispatcher = dispatcher
 }
-func (e *RawSocketEndpoint) IsAttached() bool                             { return e.dispatcher != nil }
-func (e *RawSocketEndpoint) Wait()                                        {}
-func (e *RawSocketEndpoint) ARPHardwareType() header.ARPHardwareType      { return header.ARPHardwareNone }
-func (e *RawSocketEndpoint) AddHeader(*stack.PacketBuffer)                {}
+func (e *RawSocketEndpoint) IsAttached() bool                        { return e.dispatcher != nil }
+func (e *RawSocketEndpoint) Wait()                                   {}
+func (e *RawSocketEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
+func (e *RawSocketEndpoint) AddHeader(*stack.PacketBuffer)           {}
 func (e *RawSocketEndpoint) Close() {
 	syscall.Close(e.sendFd)
 	syscall.Close(e.recvFd)
 }
-func (e *RawSocketEndpoint) SetMTU(uint32)                                {}
-func (e *RawSocketEndpoint) SetLinkAddress(tcpip.LinkAddress)             {}
-func (e *RawSocketEndpoint) ParseHeader(*stack.PacketBuffer) bool         { return true }
-func (e *RawSocketEndpoint) SetOnCloseAction(func())                      {}
+func (e *RawSocketEndpoint) SetMTU(uint32)                        {}
+func (e *RawSocketEndpoint) SetLinkAddress(tcpip.LinkAddress)     {}
+func (e *RawSocketEndpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+func (e *RawSocketEndpoint) SetOnCloseAction(func())              {}

@@ -13,8 +13,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/utils"
+	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/utils"
 )
 
 type TCPTunnel struct {
@@ -40,14 +40,14 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
-        }
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
-        }
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+		&tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+		utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
+	}
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+		&tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+		utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
+	}
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {

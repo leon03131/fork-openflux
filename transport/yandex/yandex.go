@@ -15,8 +15,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/utils"
+	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/utils"
 )
 
 type YandexDocsInfo struct {
@@ -49,8 +49,8 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string

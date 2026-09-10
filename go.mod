@@ -1,4 +1,4 @@
-module universal-bypass-tool
+module github.com/leon03131/fork-openflux
 
 go 1.26.4
 

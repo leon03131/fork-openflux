@@ -7,13 +7,13 @@ import (
 	"os"
 	"strconv"
 
-        _ "github.com/wlynxg/anet"
-	"universal-bypass-tool/socks5"
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/transport/oneme"
-	"universal-bypass-tool/transport/yandex"
-	"universal-bypass-tool/tunnel"
-	"universal-bypass-tool/utils"
+	"github.com/leon03131/fork-openflux/socks5"
+	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/transport/oneme"
+	"github.com/leon03131/fork-openflux/transport/yandex"
+	"github.com/leon03131/fork-openflux/tunnel"
+	"github.com/leon03131/fork-openflux/utils"
+	_ "github.com/wlynxg/anet"
 )
 
 var (
@@ -24,7 +24,7 @@ var (
 
 func main() {
 	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
 	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
 	client := flag.Bool("client", false, "Run as client")
