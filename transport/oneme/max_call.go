@@ -71,7 +71,7 @@ func (h *CallHandler) readLoop(conn *websocket.Conn) {
 		if text == "ping" {
 			h.mu.Lock()
 			if h.conn == conn {
-				conn.WriteMessage(websocket.TextMessage, []byte("pong"))
+				h.queueSignaling("pong")
 			}
 			h.mu.Unlock()
 			continue
@@ -107,6 +107,37 @@ func (h *CallHandler) dispatchLoop() {
 	}
 }
 
+// signalingWriter is the only writer of the call websocket. Started once
+// per CallHandler. Messages queued while disconnected are dropped (the
+// call is dead anyway; a new call re-establishes state).
+func (h *CallHandler) signalingWriter() {
+	for msg := range h.outQueue {
+		h.mu.Lock()
+		conn := h.conn
+		h.mu.Unlock()
+		if conn == nil {
+			continue
+		}
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err := conn.WriteMessage(websocket.TextMessage, msg)
+		conn.SetWriteDeadline(time.Time{})
+		if err != nil {
+			logError("[%s] signaling write failed: %v", h.tag, err)
+		}
+	}
+}
+
+// queueSignaling enqueues a message for the signaling writer.
+// Caller must hold h.mu (to keep h.seq order == write order).
+func (h *CallHandler) queueSignaling(msg string) error {
+	select {
+	case h.outQueue <- []byte(msg):
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("signaling queue full")
+	}
+}
+
 func (h *CallHandler) signalReconnect() {
 	if h.role == "caller" {
 		select {
@@ -138,7 +169,7 @@ func (h *CallHandler) sendAcceptCall() {
 	}
 	msg := fmt.Sprintf(`{"command":"accept-call","sequence":%d,"mediaSettings":{"isAudioEnabled":true,"isVideoEnabled":false,"isScreenSharingEnabled":false,"isFastScreenSharingEnabled":false,"isAudioSharingEnabled":false,"isAnimojiEnabled":false}}`, h.seq)
 	h.seq++
-	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	h.queueSignaling(msg)
 	logInfo("[%s] Accept-call sent", h.tag)
 }
 
@@ -290,7 +321,7 @@ func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 		escaped, _ := json.Marshal(sdp)
 		msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"type":"%s","sdp":%s},"animojiVersion":1},"participantType":"USER"}`,
 			h.seq, h.localID, sdpType, string(escaped))
-		if err := h.conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+		if err := h.queueSignaling(msg); err != nil {
 			logError("[%s] SDP send failed: %v", h.tag, err)
 		}
 	}
@@ -314,7 +345,7 @@ func (h *CallHandler) injectICE(payload []byte) error {
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
 		h.seq, h.localID, string(escaped))
 	h.seq++
-	return h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	return h.queueSignaling(msg)
 }
 
 func (h *CallHandler) sendICE(candidateJSON string) {
@@ -334,7 +365,7 @@ func (h *CallHandler) sendICE(candidateJSON string) {
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"candidate":{"candidate":%s}},"participantType":"USER"}`,
 		h.seq, h.localID, string(escaped))
 	h.seq++
-	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	h.queueSignaling(msg)
 }
 
 func (h *CallHandler) addICECandidate(c map[string]interface{}) {
@@ -487,7 +518,9 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h.seq = 1
 	h.reconnectCh = make(chan struct{}, 1)
 	h.msgCh = make(chan string, 1024)
+	h.outQueue = make(chan []byte, 1024)
 	go h.dispatchLoop()
+	go h.signalingWriter()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -572,7 +605,8 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
 			if err != nil {
-				logError("[CALLER] Dial error: %v, retrying...", err)
+				// Dial errors may embed the URL with credentials.
+				logError("[CALLER] Dial error: %v, retrying...", redactEndpointToken(err.Error()))
 				time.Sleep(1 * time.Second)
 				continue
 			}
@@ -597,7 +631,9 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
 	h.seq = 1
 	h.msgCh = make(chan string, 1024)
+	h.outQueue = make(chan []byte, 1024)
 	go h.dispatchLoop()
+	go h.signalingWriter()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -642,7 +678,7 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 
 			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
 			if err != nil {
-				logError("[RECEIVER] Connect error: %v", err)
+				logError("[RECEIVER] Connect error: %v", redactEndpointToken(err.Error()))
 				return
 			}
 

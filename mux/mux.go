@@ -34,6 +34,11 @@ const (
 	// maxPendingAccepts bounds streams opened by the peer but not yet
 	// picked up via Accept.
 	maxPendingAccepts = 64
+
+	// MaxActiveStreams bounds the total number of live streams; beyond
+	// it, OPEN is rejected. Prevents OOM/FD exhaustion by a hostile or
+	// buggy peer.
+	MaxActiveStreams = 4096
 )
 
 var (
@@ -123,10 +128,15 @@ func (m *Mux) Open(host string, port uint16) (*Stream, error) {
 		}
 		return st, nil
 	case <-time.After(OpenTimeout):
+		// Tell the peer: without CLOSE the exit side would keep a
+		// phantom connection forever.
+		m.send(wire.Frame{Type: wire.TypeClose, StreamID: st.id})
 		m.removeStream(st.id)
 		st.closeNoSend()
 		return nil, ErrOpenTimeout
 	case <-m.closed:
+		m.removeStream(st.id)
+		st.closeNoSend()
 		return nil, ErrClosed
 	}
 }
@@ -204,14 +214,16 @@ func (m *Mux) handleFrame(f wire.Frame) {
 	switch f.Type {
 	case wire.TypeData:
 		if st == nil {
-			// Stale data for a closed stream: tell the peer to drop it.
-			m.send(wire.Frame{Type: wire.TypeClose, StreamID: f.StreamID})
+			// Stale data for a closed stream. Do NOT reply: a garbage
+			// storm would otherwise be amplified 1:1 with CLOSE frames
+			// and block the dispatch loop. The peer recovers via its
+			// own timeouts/session rebuild.
 			return
 		}
 		st.feedData(f.Payload)
 	case wire.TypeWindowUpdate:
 		if st != nil && len(f.Payload) == 4 {
-			st.addSendWindow(int(binary.BigEndian.Uint32(f.Payload)))
+			st.addSendWindow(binary.BigEndian.Uint32(f.Payload))
 		}
 	case wire.TypeHalfClose:
 		if st != nil {
@@ -236,19 +248,40 @@ func (m *Mux) handleFrame(f wire.Frame) {
 }
 
 func (m *Mux) handleOpen(f wire.Frame) {
-	host, port, err := wire.DecodeAddress(f.Payload)
-	if err != nil {
-		m.send(wire.Frame{Type: wire.TypeOpenError, StreamID: f.StreamID, Payload: []byte(err.Error())})
+	reject := func(reason string) {
+		m.send(wire.Frame{Type: wire.TypeOpenError, StreamID: f.StreamID, Payload: []byte(reason)})
+	}
+
+	// Stream 0 is reserved for session-level frames; the peer must use
+	// IDs of ITS parity (clients odd, servers even).
+	if f.StreamID == 0 {
+		reject("stream id 0 is reserved")
+		return
+	}
+	peerIsClient := m.nextID%2 == 0 // we are the exit side
+	if peerIsClient && f.StreamID%2 != 1 {
+		reject("bad stream id parity")
 		return
 	}
 
-	st := newStream(m, f.StreamID, host, port)
+	host, port, err := wire.DecodeAddress(f.Payload)
+	if err != nil {
+		reject(err.Error())
+		return
+	}
+
 	m.mu.Lock()
 	if _, exists := m.streams[f.StreamID]; exists {
 		m.mu.Unlock()
-		m.send(wire.Frame{Type: wire.TypeOpenError, StreamID: f.StreamID, Payload: []byte(ErrStreamExists.Error())})
+		reject(ErrStreamExists.Error())
 		return
 	}
+	if len(m.streams) >= MaxActiveStreams {
+		m.mu.Unlock()
+		reject("too many active streams")
+		return
+	}
+	st := newStream(m, f.StreamID, host, port)
 	m.streams[f.StreamID] = st
 	m.mu.Unlock()
 
@@ -364,13 +397,15 @@ func (s *Stream) feedData(payload []byte) {
 	notify(s.recvNotify)
 }
 
-func (s *Stream) addSendWindow(n int) {
+func (s *Stream) addSendWindow(n uint32) {
 	s.mu.Lock()
-	// Cap at the negotiated window: the peer must not inflate it.
-	s.sendWindow += n
-	if s.sendWindow > DefaultWindowSize {
-		s.sendWindow = DefaultWindowSize
+	// Clamp via int64 (32-bit safe) and cap at the negotiated window:
+	// the peer must not inflate it.
+	credit := int64(s.sendWindow) + int64(n)
+	if credit > DefaultWindowSize {
+		credit = DefaultWindowSize
 	}
+	s.sendWindow = int(credit)
 	s.mu.Unlock()
 	notify(s.sendNotify)
 }
@@ -493,10 +528,11 @@ func (s *Stream) Write(b []byte) (int, error) {
 		err := s.m.send(wire.Frame{Type: wire.TypeData, StreamID: s.id, Payload: b[total : total+n]})
 		if err != nil {
 			// The frame was not sent: return the credit so the window
-			// accounting does not leak.
+			// accounting does not leak, and wake other writers.
 			s.mu.Lock()
 			s.sendWindow += n
 			s.mu.Unlock()
+			notify(s.sendNotify)
 			return total, err
 		}
 		total += n

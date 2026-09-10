@@ -3,10 +3,15 @@ package oneme
 import (
 	"crypto/rand"
 	"fmt"
+
+	"github.com/leon03131/fork-openflux/utils"
 )
 
+// logInfo is debug-only: routine call signaling chatter may contain
+// participant ids and ICE candidates (IPs), which must not leak into
+// default logs (AGENTS.md rule 4).
 func logInfo(format string, args ...interface{}) {
-	fmt.Printf("[INF] "+format+"\n", args...)
+	utils.Debugf("[INF] "+format, args...)
 }
 
 func logError(format string, args ...interface{}) {

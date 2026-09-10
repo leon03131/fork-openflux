@@ -9,19 +9,19 @@ Network stack research tool. TCP tunnel with pluggable transports.
 Client (SOCKS5) --> Transport --> Exit Node --> Internet
 ```
 
+Client side runs a SOCKS5 proxy; the exit node decapsulates and forwards
+traffic to the destination.
+
+Transports (carriers):
+1. **yandex** — packets via Yandex Docs cursor messages;
+2. **oneme** — packets disguised as WebRTC ICE candidates over MAX call signaling;
+3. **direct** — plain TCP reference carrier (local testing/debugging).
+
 ## Requirements
 1. Golang v. 1.26.4+ - is required for building desktop client / exit node binary;
 2. Android Native Development Kit (NDK) v.27.0.12077973+ - is required for building Android client binary;
 3. XCode v. 26.6+ - is required for building iOS client binary;
 4. Linux VPS / VDS exit node.
-
-## Overview
-
-TCP packets are sent via Transport. Currently, there are two transports available:
-1. Yandex - sends packets via Yandex Docs cursor messages;
-2. Max - sends packets disguised as WebRTC ICE candidates over the MAX call signaling channel.
-
-Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to destination point.
 
 ## Structure
 
@@ -48,7 +48,7 @@ Client side runs a SOCKS5 proxy, exit node decapsulates and forwards packets to 
 
 ```bash
 go mod tidy
-go build -o universal-bypass-tool .
+go build -o openflux .    # openflux.exe on Windows
 ```
 
 ## Build for Android (client binary)

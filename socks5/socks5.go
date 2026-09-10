@@ -220,7 +220,9 @@ func (s *SOCKS5Server) dialWithTimeout(address string) (net.Conn, error) {
 		conn net.Conn
 		err  error
 	}
-	ch := make(chan result, 1)
+	// Unbuffered: after a timeout the goroutine's only ready case is
+	// <-abandoned, so the late connection is deterministically closed.
+	ch := make(chan result)
 	abandoned := make(chan struct{})
 	go func() {
 		conn, err := s.dialer.DialTCP(address)

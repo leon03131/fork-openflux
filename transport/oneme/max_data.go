@@ -48,9 +48,10 @@ type MaxClient struct {
 	seq           atomic.Int64
 	pending       sync.Map
 	deviceID      string
-	loggedIn      bool
+	loggedIn      atomic.Bool
 	dead          atomic.Bool
 	keepaliveStop chan struct{}
+	keepaliveOnce sync.Once
 	closedCh      chan struct{}
 	closeOnce     sync.Once
 	onEvent       func(MaxPacket)
@@ -79,6 +80,9 @@ type CallHandler struct {
 	// are handled strictly in arrival order (data integrity depends on
 	// it in ICE-injection mode).
 	msgCh chan string
+	// outQueue feeds the single signaling writer goroutine, so h.mu is
+	// never held across a network write.
+	outQueue chan []byte
 	// msgMu serializes msgHandler against resetCallState.
 	msgMu sync.Mutex
 }

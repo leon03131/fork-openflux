@@ -43,7 +43,11 @@ type DocSession struct {
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.Conn.WriteMessage(messageType, data)
+	// A wedged connection must not block writers forever.
+	s.Conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	err := s.Conn.WriteMessage(messageType, data)
+	s.Conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 type YandexDocsTransport struct {
@@ -55,42 +59,51 @@ type YandexDocsTransport struct {
 	userCounter atomic.Int32
 	baseUserID  string
 
-	sentEcho dedupRing
+	sentEcho *dedupRing
+
+	connectInFlight atomic.Int32
 }
 
-// dedupRing is a small fixed-size ring of hashes of recently sent
-// payloads, used to drop our own cursor messages if the server echoes
-// them back to us (self-echo would otherwise corrupt the session).
+// dedupRingSize covers ~30s of echo latency at 130 msg/s.
+const dedupRingSize = 4096
+
+// dedupRing is a fixed-size ring of hashes of recently sent payloads,
+// used to drop our own cursor messages if the server echoes them back
+// (self-echo would otherwise burn the session's decrypt-failure budget).
 type dedupRing struct {
-	mu     sync.Mutex
-	hashes [64][32]byte
-	pos    int
-	filled bool
+	mu    sync.Mutex
+	set   map[[32]byte]struct{}
+	order [dedupRingSize][32]byte
+	pos   int
+}
+
+func newDedupRing() *dedupRing {
+	return &dedupRing{set: make(map[[32]byte]struct{}, dedupRingSize)}
 }
 
 func (r *dedupRing) add(h [32]byte) {
 	r.mu.Lock()
-	r.hashes[r.pos] = h
-	r.pos = (r.pos + 1) % len(r.hashes)
-	if r.pos == 0 {
-		r.filled = true
+	if old, ok := r.evictLocked(); ok {
+		delete(r.set, old)
 	}
+	r.order[r.pos] = h
+	r.set[h] = struct{}{}
+	r.pos = (r.pos + 1) % dedupRingSize
 	r.mu.Unlock()
+}
+
+func (r *dedupRing) evictLocked() ([32]byte, bool) {
+	if len(r.set) < dedupRingSize {
+		return [32]byte{}, false
+	}
+	return r.order[r.pos], true
 }
 
 func (r *dedupRing) contains(h [32]byte) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := len(r.hashes)
-	if !r.filled {
-		n = r.pos
-	}
-	for i := 0; i < n; i++ {
-		if r.hashes[i] == h {
-			return true
-		}
-	}
-	return false
+	_, ok := r.set[h]
+	r.mu.Unlock()
+	return ok
 }
 
 // MaxPayload is the raw message budget for the Yandex Docs carrier.
@@ -102,6 +115,7 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 	t := &YandexDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           url,
+		sentEcho:      newDedupRing(),
 	}
 	t.baseUserID = randUserID()
 	return t
@@ -160,8 +174,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	if !t.IsRunning() {
 		return
 	}
+	// Only one connect sequence at a time; if another is in flight,
+	// it owns the retry chain.
+	if !t.connectInFlight.CompareAndSwap(0, 1) {
+		return
+	}
+	defer t.connectInFlight.Store(0)
 
-	utils.Debugf("[YDOCS] connectToDoc attempt ...")
+	utils.Debugf("[YDOCS] connectToDoc attempt %d", attempt)
 
 	go func() {
 		t.Mu.Lock()
@@ -250,14 +270,19 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
-				// Only the active session's failure drives reconnects.
-				t.Mu.RLock()
-				current := t.session
-				t.Mu.RUnlock()
-				if current != session {
+				// Only the active session's failure drives reconnects;
+				// the staleness check and the state change must be
+				// atomic (a new session may install concurrently).
+				t.Mu.Lock()
+				current := t.session == session
+				if current {
+					t.SetConnected(false)
+					session.Conn.Close()
+				}
+				t.Mu.Unlock()
+				if !current {
 					return
 				}
-				t.SetConnected(false)
 				// A session that lived long enough was healthy:
 				// restart the backoff sequence.
 				if time.Since(establishedAt) > 30*time.Second {
@@ -266,6 +291,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				t.scheduleReconnect(attempt)
 				return
 			}
+			// Any inbound message proves the connection is alive.
+			conn.SetReadDeadline(time.Now().Add(75 * time.Second))
 			t.handleMessage(session, message)
 		}
 	}()
@@ -311,19 +338,19 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
-				// Only the CURRENT session may trigger teardown; a stale
-				// session's failure must not mark the new one down.
-				t.Mu.RLock()
-				stale := t.session != session
-				t.Mu.RUnlock()
-				if stale {
-					continue
+				// Only the CURRENT session may trigger teardown; the
+				// staleness check and the state change must be atomic
+				// (a new session may install concurrently).
+				t.Mu.Lock()
+				if t.session == session {
+					t.SetConnected(false)
+					// Kill the connection so the read loop wakes up and
+					// schedules a reconnect; otherwise the transport
+					// would stay disconnected forever on a half-open
+					// socket.
+					session.Conn.Close()
 				}
-				t.SetConnected(false)
-				// Kill the connection so the read loop wakes up and
-				// schedules a reconnect; otherwise the transport would
-				// stay disconnected forever on a half-open socket.
-				session.Conn.Close()
+				t.Mu.Unlock()
 			}
 		}
 	}

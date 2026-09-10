@@ -181,10 +181,27 @@ func (s *Session) writerLoop() {
 		select {
 		case msg := <-s.sendQueue:
 			if err := s.trans.Send(msg); err != nil {
+				// Carriers are reliable-ordered by contract; a send
+				// failure means the carrier is broken, and silently
+				// dropping the frame would corrupt stream accounting.
 				utils.Debugf("[SESSION] transport send failed: %v", err)
+				s.CloseWithError(fmt.Errorf("session: carrier send: %w", err))
+				return
 			}
 		case <-s.closed:
-			return
+			// Drain what is still queued (best effort, bounded) so a
+			// graceful GOAWAY and final CLOSE frames actually leave.
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				select {
+				case msg := <-s.sendQueue:
+					s.trans.Send(msg)
+				default:
+					return
+				case <-time.After(time.Until(deadline)):
+					return
+				}
+			}
 		}
 	}
 }
@@ -231,10 +248,16 @@ func (s *Session) Handshake() error {
 	select {
 	case err := <-s.helloCh:
 		if err != nil {
+			// A session that failed its handshake must not linger:
+			// its keepalive would inject plaintext PINGs into the
+			// peer's encrypted session and burn its failure budget.
+			s.CloseWithError(err)
 			return err
 		}
 	case <-time.After(HelloTimeout):
-		return fmt.Errorf("%w: timeout", ErrHandshake)
+		err := fmt.Errorf("%w: timeout", ErrHandshake)
+		s.CloseWithError(err)
+		return err
 	case <-s.closed:
 		return ErrClosed
 	}
@@ -283,6 +306,11 @@ func (s *Session) dispatch(f wire.Frame) {
 		// HELLO; the exit side answers with HELLO_ACK; the client
 		// completes the handshake by verifying the key-confirmation tag.
 		if s.isClient {
+			// A HELLO carrying a client role byte means two clients
+			// misconfigured to talk to each other.
+			if s.psk != nil && len(f.Payload) == 33 && f.Payload[0] == roleByte(true) {
+				s.failHello(ErrRoleConflict)
+			}
 			return
 		}
 		// A valid encrypted HELLO arriving after the handshake means the

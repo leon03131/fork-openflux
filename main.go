@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -315,6 +316,11 @@ func serveExitSession(ctx context.Context, sess *session.Session) error {
 		log.Printf("session lost (%v), waiting for carrier", sess.Err())
 		return nil
 	case err := <-serveErr:
+		// mux.ErrClosed here means the session died (or a GOAWAY
+		// arrived): rebuild the session instead of dying.
+		if err == nil || errors.Is(err, mux.ErrClosed) || sess.Err() != nil {
+			return nil
+		}
 		return err
 	}
 }

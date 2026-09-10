@@ -24,8 +24,13 @@ func NewMaxClient() *MaxClient {
 }
 
 func (c *MaxClient) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Never hold c.mu across a blocking dial (it can take tens of
+	// seconds) — Close and invoke must stay responsive.
+	select {
+	case <-c.closedCh:
+		return fmt.Errorf("client closed")
+	default:
+	}
 	header := http.Header{}
 	header.Set("Origin", "https://web.max.ru")
 	header.Set("User-Agent", USER_AGENT)
@@ -33,20 +38,37 @@ func (c *MaxClient) Connect() error {
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	select {
+	case <-c.closedCh:
+		c.mu.Unlock()
+		conn.Close()
+		return fmt.Errorf("client closed")
+	default:
+	}
 	c.conn = conn
-	go c.readLoop()
-	fmt.Println("[MAX] Connected")
+	c.mu.Unlock()
+	c.dead.Store(false)
+	go c.readLoop(conn)
+	logInfo("[MAX] Connected")
 	return nil
 }
 
 func (c *MaxClient) SetEventCallback(cb func(MaxPacket)) { c.onEvent = cb }
 
-func (c *MaxClient) readLoop() {
+// readLoop reads from the given connection (captured, so a reconnect
+// swapping c.conn cannot race with reads).
+func (c *MaxClient) readLoop(conn *websocket.Conn) {
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			logError("[MAX] connection lost: %v", err)
-			c.dead.Store(true)
+			c.mu.Lock()
+			current := c.conn == conn
+			c.mu.Unlock()
+			if current {
+				logError("[MAX] connection lost: %v", err)
+				c.dead.Store(true)
+			}
 			return
 		}
 		var packet MaxPacket
@@ -72,7 +94,12 @@ func (c *MaxClient) invoke(opcode int, payload map[string]interface{}) (*MaxPack
 	c.pending.Store(seq, ch)
 	defer c.pending.Delete(seq)
 	c.mu.Lock()
-	err := c.conn.WriteMessage(websocket.TextMessage, data)
+	conn := c.conn
+	if conn == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("not connected")
+	}
+	err := conn.WriteMessage(websocket.TextMessage, data)
 	c.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -108,8 +135,10 @@ func (c *MaxClient) LoginByToken(token string) error {
 	if _, ok := payload["error"]; ok {
 		return fmt.Errorf("login failed: %v", payload["error"])
 	}
-	c.loggedIn = true
-	go c.keepalive()
+	c.loggedIn.Store(true)
+	// Keepalive is started once per client; it survives reconnects
+	// because it reads the current conn via invoke.
+	c.keepaliveOnce.Do(func() { go c.keepalive() })
 	logInfo("[MAX] logged in")
 	return nil
 }
@@ -127,6 +156,12 @@ func (c *MaxClient) Supervise(token string) {
 		if !c.dead.Load() {
 			continue
 		}
+		// Race guard: Close() during the 2s sleep.
+		select {
+		case <-c.closedCh:
+			return
+		default:
+		}
 		logInfo("[MAX] reconnecting main websocket...")
 		c.mu.Lock()
 		if c.conn != nil {
@@ -134,15 +169,16 @@ func (c *MaxClient) Supervise(token string) {
 			c.conn = nil
 		}
 		c.mu.Unlock()
+		// Connect resets the dead flag on success.
 		if err := c.Connect(); err != nil {
 			logError("[MAX] reconnect failed: %v", err)
 			continue
 		}
 		if err := c.LoginByToken(token); err != nil {
 			logError("[MAX] re-login failed: %v", err)
+			c.dead.Store(true)
 			continue
 		}
-		c.dead.Store(false)
 		logInfo("[MAX] reconnected")
 	}
 }
@@ -183,7 +219,7 @@ func (c *MaxClient) keepalive() {
 		case <-c.keepaliveStop:
 			return
 		default:
-			if c.loggedIn {
+			if c.loggedIn.Load() {
 				c.invoke(1, map[string]interface{}{"interactive": false})
 			}
 		}

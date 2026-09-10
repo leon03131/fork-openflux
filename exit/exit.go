@@ -63,7 +63,9 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 	conn, err := s.dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		utils.Debugf("[EXIT] dial %s failed: %v", addr, err)
-		st.RejectOpen(err.Error())
+		// Do not leak internal dial errors (they map the exit's
+		// network); the client only needs to know it failed.
+		st.RejectOpen("dial failed")
 		return
 	}
 	defer conn.Close()
