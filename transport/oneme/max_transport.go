@@ -75,16 +75,11 @@ func (t *OneMeTransport) Stop() error {
 	if err := t.b.Stop(); err != nil {
 		return err
 	}
+	if t.ch != nil {
+		t.ch.Close()
+	}
 	if t.oneMeClient != nil {
 		t.oneMeClient.Close()
-	}
-	if t.ch != nil {
-		t.ch.mu.Lock()
-		if t.ch.conn != nil {
-			t.ch.conn.Close()
-			t.ch.conn = nil
-		}
-		t.ch.mu.Unlock()
 	}
 	return nil
 }

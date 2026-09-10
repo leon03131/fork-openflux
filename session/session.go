@@ -80,6 +80,11 @@ type Session struct {
 	closeErr     error
 
 	helloCh chan error
+
+	// confirmCh closes when the peer first proves PSK knowledge by
+	// delivering a valid encrypted frame (exit side only).
+	confirmCh   chan struct{}
+	confirmOnce sync.Once
 }
 
 // New creates a session over the transport. With a non-nil PSK the
@@ -101,6 +106,7 @@ func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 		sendQueue:  make(chan []byte, sendQueueSize),
 		closed:     make(chan struct{}),
 		helloCh:    make(chan error, 1),
+		confirmCh:  make(chan struct{}),
 	}
 	s.lastRecvNano.Store(time.Now().UnixNano())
 	reserve := wire.HeaderSize
@@ -134,6 +140,13 @@ func (s *Session) Start() error {
 		if c := s.crypto.Load(); c != nil {
 			plain, err := c.decrypt(msg)
 			if err != nil {
+				// Replay or gap: the carrier broke its reliable+ordered
+				// contract (or an attack). Kill the session at once.
+				if errors.Is(err, errReplayedMessage) || errors.Is(err, errOutOfOrder) {
+					utils.Debugf("[SESSION] fatal ordering violation: %v", err)
+					s.CloseWithError(err)
+					return
+				}
 				// A plaintext HELLO while crypto is on means the peer
 				// rebuilt its session from scratch: reset immediately
 				// instead of burning decrypt-failure budget.
@@ -150,6 +163,9 @@ func (s *Session) Start() error {
 				return
 			}
 			c.consecutiveFailures.Store(0)
+			// First successfully decrypted frame = the peer proved it
+			// holds the PSK (client confirmation on the exit side).
+			s.confirmOnce.Do(func() { close(s.confirmCh) })
 			msg = plain
 		}
 		f, err := wire.Decode(msg)
@@ -262,10 +278,24 @@ func (s *Session) Handshake() error {
 		return ErrClosed
 	}
 	if s.psk != nil {
-		// Encrypted immediately: proves our keys to the peer at once.
-		ping := make([]byte, 8)
-		binary.BigEndian.PutUint64(ping, uint64(time.Now().UnixNano()))
-		s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping})
+		if s.isClient {
+			// Encrypted immediately: proves our keys to the peer at once.
+			ping := make([]byte, 8)
+			binary.BigEndian.PutUint64(ping, uint64(time.Now().UnixNano()))
+			s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping})
+		} else {
+			// The exit side is not Ready until the client confirms it
+			// knows the PSK (first valid encrypted frame).
+			select {
+			case <-s.confirmCh:
+			case <-time.After(HelloTimeout):
+				err := fmt.Errorf("%w: peer confirmation timeout", ErrHandshake)
+				s.CloseWithError(err)
+				return err
+			case <-s.closed:
+				return ErrClosed
+			}
+		}
 	}
 	// From now on, loss of carrier connectivity kills the session; the
 	// supervisor builds a fresh one over the reconnected carrier.

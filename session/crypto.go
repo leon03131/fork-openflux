@@ -6,9 +6,11 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -28,9 +30,10 @@ import (
 // desync a counter-based nonce forever).
 
 const (
-	nonceSize    = chacha20poly1305.NonceSize
-	keySize      = chacha20poly1305.KeySize
-	aeadOverhead = nonceSize + chacha20poly1305.Overhead
+	nonceSize = chacha20poly1305.NonceSize
+	keySize   = chacha20poly1305.KeySize
+	// aeadOverhead = nonce + AEAD tag + 8-byte authenticated sequence.
+	aeadOverhead = nonceSize + chacha20poly1305.Overhead + 8
 
 	// keyConfirmTagLen = len("OPENFLUX-KC") + 64 pub bytes + AEAD tag.
 	keyConfirmTagLen = 11 + 64 + chacha20poly1305.Overhead
@@ -47,8 +50,37 @@ const maxDecryptFailures = 3
 type sessionCrypto struct {
 	send cipher.AEAD
 	recv cipher.AEAD
+	// kc is a dedicated AEAD key used ONLY for handshake key
+	// confirmation: it lives in its own key/nonce space, so the
+	// all-zero confirmation nonce can never collide with transport
+	// nonces (RFC 8439 key/nonce uniqueness).
+	kc cipher.AEAD
+
+	// Strict per-direction sequence numbers: carriers are
+	// reliable+ordered by contract, so a gap or replay means the
+	// contract is broken (or an attack) and the session must die.
+	sendSeq  atomic.Uint64
+	recvMu   sync.Mutex
+	nextRecv uint64
 
 	consecutiveFailures atomic.Int32
+}
+
+var (
+	errReplayedMessage = errors.New("session: replayed message")
+	errOutOfOrder      = errors.New("session: message gap (carrier lost a frame)")
+)
+
+// checkSeq enforces strict in-order delivery. Caller must hold recvMu.
+func (c *sessionCrypto) checkSeq(seq uint64) error {
+	if seq < c.nextRecv {
+		return errReplayedMessage
+	}
+	if seq > c.nextRecv {
+		return errOutOfOrder
+	}
+	c.nextRecv++
+	return nil
 }
 
 // generateEphemeralKey creates an X25519 keypair for the handshake.
@@ -95,6 +127,10 @@ func deriveSession(psk []byte, priv *ecdh.PrivateKey, peerPubBytes []byte, isCli
 	if err != nil {
 		return nil, err
 	}
+	kcKey, err := readKey("openflux-v2-keyconfirm")
+	if err != nil {
+		return nil, err
+	}
 
 	// Client sends with c2s, receives with s2c; server mirrors.
 	sendKey, recvKey := c2s, s2c
@@ -102,43 +138,68 @@ func deriveSession(psk []byte, priv *ecdh.PrivateKey, peerPubBytes []byte, isCli
 		sendKey, recvKey = s2c, c2s
 	}
 
-	sc := &sessionCrypto{}
+	sc := &sessionCrypto{nextRecv: 1}
 	if sc.send, err = chacha20poly1305.New(sendKey); err != nil {
 		return nil, err
 	}
 	if sc.recv, err = chacha20poly1305.New(recvKey); err != nil {
 		return nil, err
 	}
+	if sc.kc, err = chacha20poly1305.New(kcKey); err != nil {
+		return nil, err
+	}
 	return sc, nil
 }
 
-// encrypt wraps plaintext as [nonce][ciphertext].
+// encrypt wraps plaintext as [nonce][ciphertext(seq || plaintext)].
+// The 8-byte sequence travels inside the ciphertext, so it is
+// authenticated by the AEAD tag; the random nonce keeps drop tolerance
+// (a lost message does not desync counters).
 func (c *sessionCrypto) encrypt(plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	out := make([]byte, 0, nonceSize+len(plaintext)+chacha20poly1305.Overhead)
+	seq := c.sendSeq.Add(1)
+	var seqBuf [8]byte
+	binary.BigEndian.PutUint64(seqBuf[:], seq)
+	body := append(seqBuf[:], plaintext...)
+
+	out := make([]byte, 0, nonceSize+len(body)+chacha20poly1305.Overhead)
 	out = append(out, nonce...)
-	out = c.send.Seal(out, nonce, plaintext, nil)
+	out = c.send.Seal(out, nonce, body, nil)
 	return out, nil
 }
 
-// decrypt unwraps [nonce][ciphertext].
+// decrypt unwraps [nonce][ciphertext(seq || plaintext)], verifies
+// integrity and enforces strict in-order delivery: replays and gaps
+// (a lost frame) are fatal errors, because a reliable ordered carrier
+// must not exhibit either.
 func (c *sessionCrypto) decrypt(data []byte) ([]byte, error) {
-	if len(data) < nonceSize+chacha20poly1305.Overhead {
+	if len(data) < nonceSize+chacha20poly1305.Overhead+8 {
 		return nil, errors.New("session: ciphertext too short")
 	}
-	return c.recv.Open(nil, data[:nonceSize], data[nonceSize:], nil)
+	plain, err := c.recv.Open(nil, data[:nonceSize], data[nonceSize:], nil)
+	if err != nil {
+		return nil, err
+	}
+	seq := binary.BigEndian.Uint64(plain[:8])
+	c.recvMu.Lock()
+	err = c.checkSeq(seq)
+	c.recvMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return plain[8:], nil
 }
 
 // --- Key confirmation ---
 //
 // HELLO_ACK carries an AEAD tag over a constant bound to both ephemeral
 // public keys. Verifying it proves the peer derived the same keys, i.e.
-// knows the PSK. A fixed zero nonce is safe here: the tag is computed
-// exactly once per session key (random stream nonces are 96-bit, so an
-// accidental collision with the all-zero nonce is negligible).
+// knows the PSK. The tag uses the DEDICATED kc key (own key space), so
+// the fixed zero nonce is trivially unique and can never collide with
+// transport nonces.
 
 var keyConfirmNonce = make([]byte, nonceSize)
 
@@ -150,16 +211,15 @@ func keyConfirmMessage(clientPub, serverPub []byte) []byte {
 	return msg
 }
 
-// computeKeyConfirm produces the tag with the SEND key (caller: the side
+// computeKeyConfirm produces the confirmation tag (caller: the side
 // answering HELLO).
 func (c *sessionCrypto) computeKeyConfirm(clientPub, serverPub []byte) []byte {
-	return c.send.Seal(nil, keyConfirmNonce, keyConfirmMessage(clientPub, serverPub), nil)
+	return c.kc.Seal(nil, keyConfirmNonce, keyConfirmMessage(clientPub, serverPub), nil)
 }
 
-// verifyKeyConfirm checks the tag with the RECV key (caller: the side
-// that sent HELLO).
+// verifyKeyConfirm checks the tag (caller: the side that sent HELLO).
 func (c *sessionCrypto) verifyKeyConfirm(clientPub, serverPub, tag []byte) bool {
-	plain, err := c.recv.Open(nil, keyConfirmNonce, tag, nil)
+	plain, err := c.kc.Open(nil, keyConfirmNonce, tag, nil)
 	if err != nil {
 		return false
 	}

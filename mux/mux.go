@@ -15,6 +15,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/leon03131/fork-openflux/session"
@@ -39,6 +40,10 @@ const (
 	// it, OPEN is rejected. Prevents OOM/FD exhaustion by a hostile or
 	// buggy peer.
 	MaxActiveStreams = 4096
+
+	// MaxSessionBuffer bounds the total unread stream data buffered
+	// across the mux (all streams combined).
+	MaxSessionBuffer = 64 << 20 // 64 MiB
 )
 
 var (
@@ -64,6 +69,9 @@ type Mux struct {
 	mu      sync.Mutex
 	streams map[uint32]*Stream
 	nextID  uint32
+
+	// buffered tracks unread stream payload bytes across all streams.
+	buffered atomic.Int64
 
 	acceptCh  chan *Stream
 	closed    chan struct{}
@@ -109,6 +117,10 @@ func (m *Mux) Open(host string, port uint16) (*Stream, error) {
 		m.mu.Unlock()
 		return nil, ErrClosed
 	default:
+	}
+	if len(m.streams) >= MaxActiveStreams {
+		m.mu.Unlock()
+		return nil, ErrTooManyOpens
 	}
 	st.id = m.nextID
 	m.nextID += 2
@@ -156,12 +168,18 @@ func (m *Mux) DialTCP(address string) (net.Conn, error) {
 }
 
 // Accept returns the next stream opened by the peer (exit-node side).
+// Streams closed by the peer before acceptance are skipped.
 func (m *Mux) Accept() (*Stream, error) {
-	select {
-	case st := <-m.acceptCh:
-		return st, nil
-	case <-m.closed:
-		return nil, ErrClosed
+	for {
+		select {
+		case st := <-m.acceptCh:
+			if st.IsClosed() {
+				continue // stale OPEN: peer already cancelled
+			}
+			return st, nil
+		case <-m.closed:
+			return nil, ErrClosed
+		}
 	}
 }
 
@@ -327,26 +345,40 @@ type Stream struct {
 	recvUnacked  int
 	peerNotified bool // we sent Close
 
-	recvNotify    chan struct{} // cap 1
-	sendNotify    chan struct{} // cap 1
-	closedCh      chan struct{}
-	closeOnce     sync.Once
-	deadlineMu    sync.Mutex
-	readDeadline  time.Time
-	writeDeadline time.Time
+	recvNotify chan struct{} // cap 1
+	sendNotify chan struct{} // cap 1
+	closedCh   chan struct{}
+	closeOnce  sync.Once
+	deadlineMu sync.Mutex
+	// deadlineNotify wakes blocked Read/Write when deadlines change
+	// (net.Conn semantics: SetReadDeadline affects pending calls).
+	deadlineNotify chan struct{}
+	readDeadline   time.Time
+	writeDeadline  time.Time
 }
 
 func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 	return &Stream{
-		id:         id,
-		m:          m,
-		destHost:   destHost,
-		destPort:   destPort,
-		openCh:     make(chan error, 1),
-		sendWindow: DefaultWindowSize,
-		recvNotify: make(chan struct{}, 1),
-		sendNotify: make(chan struct{}, 1),
-		closedCh:   make(chan struct{}),
+		id:             id,
+		m:              m,
+		destHost:       destHost,
+		destPort:       destPort,
+		openCh:         make(chan error, 1),
+		sendWindow:     DefaultWindowSize,
+		recvNotify:     make(chan struct{}, 1),
+		sendNotify:     make(chan struct{}, 1),
+		closedCh:       make(chan struct{}),
+		deadlineNotify: make(chan struct{}, 1),
+	}
+}
+
+// IsClosed reports whether the stream is fully closed.
+func (s *Stream) IsClosed() bool {
+	select {
+	case <-s.closedCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -389,6 +421,14 @@ func (s *Stream) feedData(payload []byte) {
 	if s.recvUnacked > DefaultWindowSize+s.m.sess.MaxFramePayload() {
 		s.mu.Unlock()
 		utils.Debugf("[MUX] stream %d exceeded receive window, resetting", s.id)
+		s.Close()
+		return
+	}
+	// Global session budget across all streams.
+	if s.m.buffered.Add(int64(len(payload))) > MaxSessionBuffer {
+		s.m.buffered.Add(-int64(len(payload)))
+		s.mu.Unlock()
+		utils.Debugf("[MUX] session buffer budget exceeded, resetting stream %d", s.id)
 		s.Close()
 		return
 	}
@@ -453,6 +493,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 		if s.recvBuf.Len() > 0 {
 			n, _ := s.recvBuf.Read(b)
 			s.recvUnacked -= n
+			s.m.buffered.Add(-int64(n))
 			credit := n + s.pendingCredit
 			s.pendingCredit = 0
 			s.mu.Unlock()
@@ -482,6 +523,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 		select {
 		case <-s.recvNotify:
 		case <-s.closedCh:
+		case <-s.deadlineNotify: // deadline changed: recompute
 		case <-dch:
 			return 0, errTimeout
 		}
@@ -501,6 +543,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 			select {
 			case <-s.sendNotify:
 			case <-s.closedCh:
+			case <-s.deadlineNotify: // deadline changed: recompute
 			case <-dch:
 				return total, errTimeout
 			}
@@ -580,6 +623,7 @@ func (s *Stream) SetDeadline(t time.Time) error {
 	s.readDeadline = t
 	s.writeDeadline = t
 	s.deadlineMu.Unlock()
+	notify(s.deadlineNotify)
 	return nil
 }
 
@@ -587,6 +631,7 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 	s.deadlineMu.Lock()
 	s.readDeadline = t
 	s.deadlineMu.Unlock()
+	notify(s.deadlineNotify)
 	return nil
 }
 
@@ -594,6 +639,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.deadlineMu.Lock()
 	s.writeDeadline = t
 	s.deadlineMu.Unlock()
+	notify(s.deadlineNotify)
 	return nil
 }
 

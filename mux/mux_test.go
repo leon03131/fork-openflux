@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -248,7 +249,7 @@ func TestConcurrentStreams(t *testing.T) {
 				return
 			}
 			if !bytes.Equal(buf, msg) {
-				errs <- err
+				errs <- errors.New("data mismatch")
 			}
 		}(i)
 	}
@@ -256,6 +257,37 @@ func TestConcurrentStreams(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Fatalf("concurrent stream: %v", err)
+	}
+}
+
+func TestDeadlineWakesBlockedRead(t *testing.T) {
+	cm, sm := newMuxPair(t)
+	go echoAcceptor(t, sm)
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	// Start a Read with NO data available; it blocks. Then set a
+	// deadline while blocked: the Read must wake and time out.
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := st.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let Read block
+	st.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected timeout error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("blocked Read ignored SetReadDeadline")
 	}
 }
 

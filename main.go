@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -87,6 +90,7 @@ func run() error {
 	flag.StringVar(&cfg.maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	flag.StringVar(&cfg.addr, "addr", "", "Address for direct transport (client: exit address; exit: listen address)")
 	flag.StringVar(&cfg.psk, "psk", "", "Pre-shared key for v2 encryption (or env OPENFLUX_PSK)")
+	insecure := flag.Bool("insecure", false, "Allow v2 without encryption (testing only)")
 	flag.CommandLine.Usage = usage
 	// NOTE: parse the sliced args, not os.Args, so subcommands work.
 	if err := flag.CommandLine.Parse(args); err != nil {
@@ -126,8 +130,15 @@ func run() error {
 	if cfg.psk == "" {
 		cfg.psk = os.Getenv("OPENFLUX_PSK")
 	}
-	if cfg.mode == "v2" && cfg.psk == "" {
-		log.Printf("WARNING: no --psk/OPENFLUX_PSK set - v2 session is UNENCRYPTED")
+	if cfg.mode == "v2" && cfg.psk == "" && !*insecure {
+		return fmt.Errorf("v2 requires --psk (or env OPENFLUX_PSK); pass --insecure to disable encryption")
+	}
+	if cfg.psk != "" {
+		strong, err := validatePSK(cfg.psk)
+		if err != nil {
+			return err
+		}
+		cfg.psk = strong
 	}
 
 	log.Printf("=== OpenFlux %s ===", Version)
@@ -186,8 +197,26 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 	return trans, nil
 }
 
+// validatePSK enforces PSK strength: 32-byte base64/hex keys are decoded;
+// passphrases must be >= 16 characters.
+func validatePSK(psk string) (string, error) {
+	if b, err := hex.DecodeString(psk); err == nil && len(b) == 32 {
+		return psk, nil // 32-byte hex key
+	}
+	if b, err := base64.StdEncoding.DecodeString(psk); err == nil && len(b) == 32 {
+		return psk, nil // 32-byte base64 key
+	}
+	if len(psk) < 16 {
+		return "", fmt.Errorf("PSK too weak: use %d+ chars, or a 32-byte base64/hex key (e.g. `openssl rand -base64 32`)", 16)
+	}
+	return psk, nil
+}
+
 // runLegacy runs the original gVisor packet tunnel (exit node needs root).
 func runLegacy(ctx context.Context, trans transport.Transport, cfg *cliConfig) error {
+	if cfg.exitNode && runtime.GOOS == "windows" {
+		return fmt.Errorf("legacy exit node is unsupported on Windows (raw socket restrictions); use --mode v2")
+	}
 	if err := trans.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
 	}

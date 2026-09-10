@@ -30,7 +30,10 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(append([]byte{}, data...)),
 	})
+	// gVisor: the caller retains ownership and must DecRef after
+	// delivery (the stack IncRefs internally if it needs the packet).
 	e.dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
+	pkt.DecRef()
 }
 
 func (e *TunnelLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {

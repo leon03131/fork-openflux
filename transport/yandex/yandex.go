@@ -175,15 +175,16 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		return
 	}
 	// Only one connect sequence at a time; if another is in flight,
-	// it owns the retry chain.
+	// it owns the retry chain. The flag is held for the WHOLE
+	// goroutine lifecycle (dial + read loop), not just this call.
 	if !t.connectInFlight.CompareAndSwap(0, 1) {
 		return
 	}
-	defer t.connectInFlight.Store(0)
 
 	utils.Debugf("[YDOCS] connectToDoc attempt %d", attempt)
 
 	go func() {
+		defer t.connectInFlight.Store(0)
 		t.Mu.Lock()
 		existingSession := t.session
 		t.Mu.Unlock()
@@ -317,6 +318,16 @@ func (t *YandexDocsTransport) writerLoop() {
 
 			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 				utils.Debugf("[YDOCS] Write error: %v", err)
+				// A failed write means the connection is broken:
+				// close it so the read loop wakes and reconnects.
+				// Frames in the queue survive for the next session
+				// (legacy mode) or are dropped with the session (v2).
+				t.Mu.Lock()
+				if t.session == session {
+					t.SetConnected(false)
+					session.Conn.Close()
+				}
+				t.Mu.Unlock()
 			}
 		case <-time.After(250 * time.Millisecond):
 			// Periodic wake-up to re-check IsRunning and session.

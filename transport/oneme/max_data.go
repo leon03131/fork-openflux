@@ -83,6 +83,9 @@ type CallHandler struct {
 	// outQueue feeds the single signaling writer goroutine, so h.mu is
 	// never held across a network write.
 	outQueue chan []byte
+	// done stops dispatchLoop/signalingWriter/reconnect goroutines.
+	done     chan struct{}
+	doneOnce sync.Once
 	// msgMu serializes msgHandler against resetCallState.
 	msgMu sync.Mutex
 }

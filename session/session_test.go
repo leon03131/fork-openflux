@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -121,20 +122,18 @@ func TestWrongPSKFailsHandshake(t *testing.T) {
 		t.Fatalf("unexpected handshake error: %v", err)
 	}
 
-	// The server completes its handshake and stays up (it has no way to
-	// know the client had the wrong key until encrypted frames arrive).
+	// The server waits for the client's encrypted confirmation, which
+	// never comes (wrong PSK). Close it and expect a clean shutdown.
+	sb.Close()
 	select {
 	case err := <-serverDone:
-		if err != nil {
+		if !errors.Is(err, ErrClosed) {
 			t.Fatalf("server handshake: %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("server handshake timeout")
+		t.Fatal("server handshake stuck after Close")
 	}
-
-	// Sanity: a correct-PSK pair still works (covered by other tests).
 	sa.Close()
-	sb.Close()
 }
 
 func TestUndecryptableFramesKillSession(t *testing.T) {
@@ -209,5 +208,81 @@ func TestTamperedCiphertextRejected(t *testing.T) {
 	blob[len(blob)-1] ^= 0xFF // flip a bit
 	if _, err := c.decrypt(blob); err == nil {
 		t.Fatal("tampered ciphertext decrypted")
+	}
+}
+
+// cryptoPair returns client and server sessionCrypto with matching keys.
+func cryptoPair(t *testing.T) (*sessionCrypto, *sessionCrypto) {
+	t.Helper()
+	privC, _ := generateEphemeralKey()
+	privS, _ := generateEphemeralKey()
+	client, err := deriveSession([]byte("k"), privC, privS.PublicKey().Bytes(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := deriveSession([]byte("k"), privS, privC.PublicKey().Bytes(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, server
+}
+
+func TestReplayRejected(t *testing.T) {
+	client, server := cryptoPair(t)
+
+	// Receive several messages.
+	blobs := make([][]byte, 5)
+	for i := range blobs {
+		var err error
+		blobs[i], err = client.encrypt([]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.decrypt(blobs[i]); err != nil {
+			t.Fatalf("decrypt %d: %v", i, err)
+		}
+	}
+	// Replay the middle one: must be rejected.
+	if _, err := server.decrypt(blobs[2]); !errors.Is(err, errReplayedMessage) {
+		t.Fatalf("replay accepted: %v", err)
+	}
+	// Replay the newest: rejected.
+	if _, err := server.decrypt(blobs[4]); !errors.Is(err, errReplayedMessage) {
+		t.Fatalf("replay accepted: %v", err)
+	}
+	// A brand new message still passes.
+	fresh, _ := client.encrypt([]byte{99})
+	if _, err := server.decrypt(fresh); err != nil {
+		t.Fatalf("fresh message rejected: %v", err)
+	}
+}
+
+func TestGapKillsOrdering(t *testing.T) {
+	client, server := cryptoPair(t)
+	// Strict in-order delivery: a lost message must be fatal, because
+	// the carrier contract is reliable+ordered.
+	first, _ := client.encrypt([]byte{1})
+	client.encrypt([]byte{2})  // seq 2: never delivered
+	third, _ := client.encrypt([]byte{3})
+	if _, err := server.decrypt(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.decrypt(third); !errors.Is(err, errOutOfOrder) {
+		t.Fatalf("gap not detected: %v", err)
+	}
+}
+
+func TestBothDirectionsIndependent(t *testing.T) {
+	client, server := cryptoPair(t)
+	// Interleave directions; each direction has its own counter/window.
+	for i := 0; i < 4; i++ {
+		c2s, _ := client.encrypt([]byte{byte(i)})
+		if _, err := server.decrypt(c2s); err != nil {
+			t.Fatalf("c2s %d: %v", i, err)
+		}
+		s2c, _ := server.encrypt([]byte{byte(i)})
+		if _, err := client.decrypt(s2c); err != nil {
+			t.Fatalf("s2c %d: %v", i, err)
+		}
 	}
 }

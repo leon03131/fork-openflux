@@ -59,6 +59,11 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 	defer st.Close()
 
+	// The peer may have closed the stream while it sat in acceptCh.
+	if st.IsClosed() {
+		return
+	}
+
 	addr := wire.JoinHostPort(st.DestHost(), st.DestPort())
 	conn, err := s.dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -78,7 +83,9 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 	relay(conn, st)
 }
 
-// relay copies in both directions, propagating half-closes.
+// relay copies in both directions, propagating half-closes. When one
+// direction ends, the opposite read gets a grace deadline so a peer
+// holding its side open forever cannot leak the goroutine and the FD.
 func relay(conn net.Conn, st *mux.Stream) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -92,6 +99,9 @@ func relay(conn net.Conn, st *mux.Stream) {
 		} else {
 			conn.Close()
 		}
+		// If the destination never closes its side, wake the other
+		// goroutine's conn.Read after a grace period.
+		conn.SetReadDeadline(time.Now().Add(halfCloseGrace))
 	}()
 
 	go func() {

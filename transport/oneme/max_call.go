@@ -98,33 +98,71 @@ func (h *CallHandler) readLoop(conn *websocket.Conn) {
 }
 
 // dispatchLoop is the single consumer of signaling messages, keeping
-// strict FIFO order. Started once per CallHandler.
+// strict FIFO order. Started once per CallHandler; stops on Close.
 func (h *CallHandler) dispatchLoop() {
-	for text := range h.msgCh {
-		h.msgMu.Lock()
-		h.msgHandler(text)
-		h.msgMu.Unlock()
+	for {
+		select {
+		case text := <-h.msgCh:
+			h.msgMu.Lock()
+			h.msgHandler(text)
+			h.msgMu.Unlock()
+		case <-h.done:
+			return
+		}
 	}
 }
 
 // signalingWriter is the only writer of the call websocket. Started once
-// per CallHandler. Messages queued while disconnected are dropped (the
-// call is dead anyway; a new call re-establishes state).
+// per CallHandler; stops on Close. Messages queued while disconnected are
+// dropped (the call is dead anyway; a new call re-establishes state).
 func (h *CallHandler) signalingWriter() {
-	for msg := range h.outQueue {
-		h.mu.Lock()
-		conn := h.conn
-		h.mu.Unlock()
-		if conn == nil {
-			continue
-		}
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		err := conn.WriteMessage(websocket.TextMessage, msg)
-		conn.SetWriteDeadline(time.Time{})
-		if err != nil {
-			logError("[%s] signaling write failed: %v", h.tag, err)
+	for {
+		select {
+		case msg := <-h.outQueue:
+			h.mu.Lock()
+			conn := h.conn
+			h.mu.Unlock()
+			if conn == nil {
+				continue
+			}
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := conn.WriteMessage(websocket.TextMessage, msg)
+			conn.SetWriteDeadline(time.Time{})
+			if err != nil {
+				logError("[%s] signaling write failed: %v", h.tag, err)
+				// Broken connection: close it so the read loop wakes
+				// and the reconnect machinery kicks in.
+				h.mu.Lock()
+				if h.conn == conn {
+					h.conn.Close()
+					h.conn = nil
+				}
+				h.mu.Unlock()
+			}
+		case <-h.done:
+			return
 		}
 	}
+}
+
+// Close stops all CallHandler goroutines.
+func (h *CallHandler) Close() {
+	h.doneOnce.Do(func() {
+		close(h.done)
+		h.mu.Lock()
+		if h.conn != nil {
+			h.conn.Close()
+			h.conn = nil
+		}
+		if h.pc != nil {
+			pc := h.pc
+			h.pc = nil
+			h.mu.Unlock()
+			pc.Close()
+			return
+		}
+		h.mu.Unlock()
+	})
 }
 
 // queueSignaling enqueues a message for the signaling writer.
@@ -519,6 +557,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h.reconnectCh = make(chan struct{}, 1)
 	h.msgCh = make(chan string, 1024)
 	h.outQueue = make(chan []byte, 1024)
+	h.done = make(chan struct{})
 	go h.dispatchLoop()
 	go h.signalingWriter()
 	h.msgHandler = func(text string) {
@@ -576,6 +615,11 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	// Connect with auto-reconnect loop
 	go func() {
 		for {
+			select {
+			case <-h.done:
+				return
+			default:
+			}
 			h.msgMu.Lock()
 			h.resetCallState()
 			h.msgMu.Unlock()
@@ -632,6 +676,7 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 	h.seq = 1
 	h.msgCh = make(chan string, 1024)
 	h.outQueue = make(chan []byte, 1024)
+	h.done = make(chan struct{})
 	go h.dispatchLoop()
 	go h.signalingWriter()
 	h.msgHandler = func(text string) {
