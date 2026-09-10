@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -23,6 +24,8 @@ type TCPTunnel struct {
 	isExitNode  bool
 	rawEP       *RawSocketEndpoint
 	startTime   time.Time
+	done        chan struct{}
+	closeOnce   sync.Once
 }
 
 func NewTCPTunnel(trans transport.Transport, isExitNode bool) (*TCPTunnel, error) {
@@ -30,6 +33,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) (*TCPTunnel, error
 		transport:  trans,
 		isExitNode: isExitNode,
 		startTime:  time.Now(),
+		done:       make(chan struct{}),
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -179,11 +183,29 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 	}, ipv4.ProtocolNumber)
 }
 
+// Close releases the raw socket and the gVisor stack and stops the
+// stats goroutine. Safe to call multiple times.
+func (t *TCPTunnel) Close() {
+	t.closeOnce.Do(func() {
+		close(t.done)
+		if t.rawEP != nil {
+			t.rawEP.Close()
+		}
+		t.gvisorStack.Close()
+	})
+}
+
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-ticker.C:
+		}
+
 		stats := t.gvisorStack.Stats()
 		var rawIn, rawOut uint64
 		if t.rawEP != nil {

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	_ "github.com/wlynxg/anet"
 
@@ -25,7 +28,13 @@ var (
 
 func main() {
 	fmt.Print("written by p1neappleXpress\n")
+	if err := run(); err != nil {
+		log.Printf("FATAL: %v", err)
+		os.Exit(1)
+	}
+}
 
+func run() error {
 	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
@@ -37,9 +46,9 @@ func main() {
 	flag.Parse()
 
 	if *exitNode == *client {
-		// Either exactly one mode is set, or none.
+		// Exactly one mode must be selected.
 		flag.Usage()
-		os.Exit(1)
+		return fmt.Errorf("select exactly one of --client or --exit-node")
 	}
 
 	if *debug {
@@ -56,36 +65,55 @@ func main() {
 	switch *transportType {
 	case "yandex":
 		if globalDocUrl == "" || globalDocUrl == "http://#" {
-			log.Fatalf("--url is required for the yandex transport (Yandex Docs document URL)")
+			return fmt.Errorf("--url is required for the yandex transport (Yandex Docs document URL)")
 		}
 		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(globalDocUrl, config))
 	case "oneme":
 		uidint, err := strconv.ParseInt(maxUid, 10, 64)
 		if err != nil {
-			log.Fatalf("Invalid --maxUid %q: %v", maxUid, err)
+			return fmt.Errorf("invalid --maxUid %q: %w", maxUid, err)
 		}
 		trans = transport.NewCompressedTransport(oneme.NewOneMeTransport(*exitNode, maxToken, uidint, config))
 	default:
-		log.Fatalf("Unknown transport type: %s", *transportType)
+		return fmt.Errorf("unknown transport type: %s", *transportType)
 	}
 
 	if err := trans.Start(); err != nil {
-		log.Fatalf("Failed to start transport: %v", err)
+		return fmt.Errorf("failed to start transport: %w", err)
 	}
 
 	tun, err := tunnel.NewTCPTunnel(trans, *exitNode)
 	if err != nil {
 		trans.Stop() // do not leave the transport running after a failed init
-		log.Fatalf("Failed to init tunnel: %v", err)
+		return fmt.Errorf("failed to init tunnel: %w", err)
 	}
+
+	// Graceful shutdown on SIGINT/SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	if *exitNode {
 		log.Printf("Running as EXIT NODE (needs root for raw socket)")
 		log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
-		select {}
+		<-ctx.Done()
 	} else {
 		log.Printf("Running as CLIENT (SOCKS5 on %s)", *socksAddr)
 		socks5Server := socks5.NewSOCKS5Server(*socksAddr, tun)
-		log.Fatal(socks5Server.Start())
+		errCh := make(chan error, 1)
+		go func() { errCh <- socks5Server.Start() }()
+
+		select {
+		case err := <-errCh:
+			tun.Close()
+			trans.Stop()
+			return err
+		case <-ctx.Done():
+			socks5Server.Close()
+		}
 	}
+
+	log.Printf("Shutting down...")
+	tun.Close()
+	trans.Stop()
+	return nil
 }

@@ -353,6 +353,8 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 			break
 		}
 	}
+	// Add jitter (50%-150% of the delay) to avoid reconnect storms.
+	delay = delay/2 + time.Duration(rand.Int63n(int64(delay/2)+1))
 
 	utils.Debugf("[YDOCS] Reconnect #%d in %v", attempt+1, delay)
 	time.AfterFunc(delay, func() {

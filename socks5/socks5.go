@@ -42,10 +42,23 @@ type Dialer interface {
 type SOCKS5Server struct {
 	listenAddr string
 	dialer     Dialer
+
+	mu       sync.Mutex
+	listener net.Listener
 }
 
 func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
 	return &SOCKS5Server{listenAddr: addr, dialer: dialer}
+}
+
+// Close stops accepting new connections; Start returns nil afterwards.
+func (s *SOCKS5Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener != nil {
+		return s.listener.Close()
+	}
+	return nil
 }
 
 func (s *SOCKS5Server) Start() error {
@@ -53,6 +66,9 @@ func (s *SOCKS5Server) Start() error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.listener = listener
+	s.mu.Unlock()
 	defer listener.Close()
 
 	utils.Debugf("[SOCKS5] Listening on %s", s.listenAddr)
