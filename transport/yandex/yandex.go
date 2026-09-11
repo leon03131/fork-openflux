@@ -580,6 +580,17 @@ func randUserID() string {
 	return fmt.Sprintf("%010d", rand.New(rand.NewSource(time.Now().UnixNano())).Intn(1000000000))
 }
 
+// Bounce drops the current websocket; the reconnect chain rebuilds it.
+// Implements transport.Bouncer.
+func (t *YandexDocsTransport) Bounce() {
+	t.Mu.RLock()
+	s := t.session
+	t.Mu.RUnlock()
+	if s != nil && s.Conn != nil {
+		s.Conn.Close()
+	}
+}
+
 // CheckDoc verifies that the document URL is reachable and has a
 // compatible client-config (used by `openflux doctor`).
 func CheckDoc(url string) error {

@@ -318,7 +318,15 @@ func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error
 			m.Close()
 		case <-sess.Closed():
 			log.Printf("session lost (%v), waiting for carrier", sess.Err())
+			// Point the dialer at nothing while rebuilding, so new
+			// SOCKS5 connections get a clear "reconnecting" error
+			// instead of hitting a dead mux.
+			dialer.v.Store(nil)
 			m.Close()
+			// Give the next session a clean carrier channel.
+			if b, ok := trans.(transport.Bouncer); ok {
+				b.Bounce()
+			}
 		case err := <-socksErrCh:
 			m.Close()
 			return err

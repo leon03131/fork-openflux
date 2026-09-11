@@ -211,8 +211,13 @@ func (s *Session) writerLoop() {
 				return
 			}
 		case <-s.closed:
-			// Drain what is still queued (best effort, bounded) so a
-			// graceful GOAWAY and final CLOSE frames actually leave.
+			// Drain only on GRACEFUL shutdown (GOAWAY/CLOSE matter).
+			// On fatal errors the queue holds frames of a dead
+			// generation — sending them would poison the next session
+			// on the same carrier.
+			if s.closeErr != ErrClosed {
+				return
+			}
 			deadline := time.Now().Add(2 * time.Second)
 			for {
 				select {

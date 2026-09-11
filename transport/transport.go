@@ -135,3 +135,10 @@ func (b *BaseTransport) RecordReconnect() {
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config
 }
+
+// Bouncer is an optional Transport capability: force the underlying
+// connection to drop and reconnect, giving the next session a clean
+// channel. Used by the supervisor after a fatal session error.
+type Bouncer interface {
+	Bounce()
+}

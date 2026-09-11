@@ -88,6 +88,20 @@ func (t *OneMeTransport) IsConnected() bool {
 	return t.b.IsConnected()
 }
 
+// Bounce drops the current call signaling connection; the caller loop
+// reconnects. Implements transport.Bouncer.
+func (t *OneMeTransport) Bounce() {
+	if t.ch == nil {
+		return
+	}
+	t.ch.mu.Lock()
+	conn := t.ch.conn
+	t.ch.mu.Unlock()
+	if conn != nil {
+		t.ch.failConnection(conn)
+	}
+}
+
 // MaxPayload is the raw message budget for the MAX signaling carrier
 // (payloads are base64-wrapped into JSON "ICE candidate" messages).
 func (t *OneMeTransport) MaxPayload() int { return 16 * 1024 }

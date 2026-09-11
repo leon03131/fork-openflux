@@ -236,6 +236,17 @@ func (t *DirectTransport) killConn(conn net.Conn) {
 	conn.Close()
 }
 
+// Bounce forces the current connection down; the dial/accept loops
+// reconnect with a clean byte stream. Implements Bouncer.
+func (t *DirectTransport) Bounce() {
+	t.mu.Lock()
+	conn := t.conn
+	t.mu.Unlock()
+	if conn != nil {
+		t.killConn(conn)
+	}
+}
+
 // MaxPayload implements the session payloadCapacitor extension.
 func (t *DirectTransport) MaxPayload() int { return t.maxPayload }
 

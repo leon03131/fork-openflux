@@ -24,8 +24,10 @@ type Server struct {
 
 func NewServer(m *mux.Mux) *Server {
 	return &Server{
-		mux:    m,
-		dialer: net.Dialer{Timeout: 15 * time.Second},
+		mux: m,
+		// Deliberately smaller than mux.OpenTimeout (25s): the client
+		// must get OPEN_ERROR, not a timeout, on slow destinations.
+		dialer: net.Dialer{Timeout: 10 * time.Second},
 	}
 }
 

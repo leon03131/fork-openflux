@@ -31,7 +31,9 @@ const (
 	DefaultWindowSize = 512 * 1024
 
 	// OpenTimeout bounds the OPEN -> OPEN_OK/OPEN_ERROR handshake.
-	OpenTimeout = 15 * time.Second
+	// It is deliberately larger than the exit's dial timeout (10s) so
+	// the exit can always answer OPEN_ERROR before we give up.
+	OpenTimeout = 25 * time.Second
 
 	// maxPendingAccepts bounds streams opened by the peer but not yet
 	// picked up via Accept.
