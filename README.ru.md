@@ -83,13 +83,13 @@ v2 **требует** общий секрет (`--psk` / `OPENFLUX_PSK`) — с�
 
 Выходная нода (любой Linux, без root):
 ```bash
-export OPENFLUX_PSK="your-long-random-shared-secret"
+export OPENFLUX_PSK="$(openssl rand -base64 32)"
 ./openflux exit --transport yandex --url "YOUR_YANDEX_DOC_URL"
 ```
 
 Клиент:
 ```bash
-export OPENFLUX_PSK="your-long-random-shared-secret"
+export OPENFLUX_PSK="$(openssl rand -base64 32)"
 ./openflux client --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
 ```
 
@@ -100,8 +100,8 @@ export OPENFLUX_PSK="your-long-random-shared-secret"
 carrier `direct` (чистый TCP):
 
 ```bash
-./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk secret
-./openflux client --transport direct --addr EXIT_IP:9000 --psk secret
+./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk $env:OPENFLUX_PSK
+./openflux client --transport direct --addr EXIT_IP:9000 --psk $env:OPENFLUX_PSK
 ```
 
 Диагностика: `./openflux doctor --transport ...` — проверка конфигурации

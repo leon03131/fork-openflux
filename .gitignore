@@ -39,3 +39,5 @@ Thumbs.db
 *.log
 
 race-test.ps1
+
+output/

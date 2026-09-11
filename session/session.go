@@ -69,6 +69,11 @@ type Session struct {
 	handler   func(wire.Frame)
 	handlerMu sync.RWMutex
 
+	// sendMu serializes encode -> encrypt(seq allocation) -> queue
+	// insertion, so queue order always matches sequence order even with
+	// concurrent SendFrame callers.
+	sendMu sync.Mutex
+
 	// sendQueue feeds the single writer goroutine; this keeps the
 	// inbound dispatch path non-blocking even when the carrier write
 	// stalls (no lock is ever held across a network write).
@@ -459,9 +464,14 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	if err != nil {
 		return err
 	}
+	// Serialized: the sequence allocated in encrypt() must match the
+	// position in the queue, otherwise a concurrent sender could
+	// enqueue a higher seq first and the peer would report a gap.
+	s.sendMu.Lock()
 	if c := s.crypto.Load(); c != nil {
 		buf, err = c.encrypt(buf)
 		if err != nil {
+			s.sendMu.Unlock()
 			return err
 		}
 	}
@@ -469,8 +479,10 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	// when the carrier is saturated; unblocks with ErrClosed on Close.
 	select {
 	case s.sendQueue <- buf:
+		s.sendMu.Unlock()
 		return nil
 	case <-s.closed:
+		s.sendMu.Unlock()
 		return ErrClosed
 	}
 }

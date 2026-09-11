@@ -17,6 +17,12 @@ import (
 // newMuxPair builds a client/server mux pair over in-process sessions.
 func newMuxPair(t *testing.T) (*Mux, *Mux) {
 	t.Helper()
+	return newMuxPairPSK(t, nil)
+}
+
+// newMuxPairPSK is newMuxPair with an optional PSK (nil = plaintext).
+func newMuxPairPSK(t *testing.T, psk []byte) (*Mux, *Mux) {
+	t.Helper()
 	ta, tb := transport.NewMemoryTransportPair(transport.DefaultConfig())
 	if err := ta.Start(); err != nil {
 		t.Fatal(err)
@@ -24,11 +30,11 @@ func newMuxPair(t *testing.T) (*Mux, *Mux) {
 	if err := tb.Start(); err != nil {
 		t.Fatal(err)
 	}
-	sa, err := session.New(ta, nil, true)
+	sa, err := session.New(ta, psk, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sb, err := session.New(tb, nil, false)
+	sb, err := session.New(tb, psk, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,6 +392,56 @@ func TestSetDeadlineWakesBothDirections(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("SetDeadline did not wake both Read and Write")
+	}
+}
+
+// TestConcurrentStreamsEncrypted hammers an ENCRYPTED session with 64
+// concurrent streams doing simultaneous writes: the strict in-order
+// sequence check must not fire on a healthy carrier, and all data must
+// arrive intact. Regression test for the seq-allocation vs queue-order
+// race.
+func TestConcurrentStreamsEncrypted(t *testing.T) {
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	cm, sm := newMuxPairPSK(t, psk)
+	go echoAcceptor(t, sm)
+
+	const n = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			st, err := cm.Open("example.com", 443)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer st.Close()
+			// Several writes per stream to maximize interleaving.
+			var expect []byte
+			for j := 0; j < 4; j++ {
+				expect = append(expect, bytes.Repeat([]byte{byte(i), byte(j)}, 5000)...)
+			}
+			if _, err := st.Write(expect); err != nil {
+				errs <- err
+				return
+			}
+			buf := make([]byte, len(expect))
+			st.SetReadDeadline(time.Now().Add(15 * time.Second))
+			if _, err := io.ReadFull(st, buf); err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(buf, expect) {
+				errs <- errors.New("data mismatch")
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent encrypted stream: %v", err)
 	}
 }
 
