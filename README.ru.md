@@ -2,6 +2,8 @@
 
 [English](README.md) | **Русский**
 
+*Оригинал: [p1neappleXpress](https://github.com/p1neappleXpress/OpenFlux) · форк: [leon03131](https://github.com/leon03131/fork-openflux)*
+
 Исследовательский инструмент сетевого стека. TCP-туннель с подключаемыми транспортами.
 
 ## Обзор

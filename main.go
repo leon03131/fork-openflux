@@ -48,7 +48,7 @@ type cliConfig struct {
 }
 
 func main() {
-	fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress, fork by leon03131\n")
 	if err := run(); err != nil {
 		log.Printf("FATAL: %v", err)
 		os.Exit(1)
@@ -73,7 +73,17 @@ Flags:
 
 func run() error {
 	args := os.Args[1:]
+	if len(args) == 0 {
+		// No arguments at all: interactive wizard instead of usage+FATAL.
+		return runWizard()
+	}
+	return runArgs(args)
+}
 
+// runArgs executes the regular flag-based flow for the given argument
+// vector (without the program name). Kept separate from run() so the
+// wizard can replay collected answers through the exact same path.
+func runArgs(args []string) error {
 	cmd := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd = args[0]

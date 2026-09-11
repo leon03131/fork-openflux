@@ -2,6 +2,8 @@
 
 **English** | [Русский](README.ru.md)
 
+*Original by [p1neappleXpress](https://github.com/p1neappleXpress/OpenFlux) · fork by [leon03131](https://github.com/leon03131/fork-openflux)*
+
 Network stack research tool. TCP tunnel with pluggable transports.
 
 ## Overview
