@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"net"
 	"testing"
 )
@@ -24,4 +25,30 @@ func freeTCPAddr(t *testing.T) string {
 	}
 	defer l.Close()
 	return l.Addr().String()
+}
+
+// partialWriteConn writes at most 7 bytes per Write call, simulating
+// partial writes that desynced the stream in production.
+type partialWriteConn struct {
+	net.Conn
+	written bytes.Buffer
+}
+
+func (c *partialWriteConn) Write(p []byte) (int, error) {
+	n := min(7, len(p))
+	return c.written.Write(p[:n])
+}
+
+func TestWriteAllHandlesPartialWrites(t *testing.T) {
+	c := &partialWriteConn{}
+	payload := make([]byte, 1000)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := writeAll(c, payload); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(c.written.Bytes(), payload) {
+		t.Fatalf("partial writes lost/corrupted data: got %d bytes", c.written.Len())
+	}
 }

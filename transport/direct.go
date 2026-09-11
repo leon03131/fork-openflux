@@ -193,13 +193,47 @@ func (t *DirectTransport) Send(data []byte) error {
 	copy(frame[4:], data)
 	// A wedged peer must not block the session writer forever.
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	_, err := conn.Write(frame)
-	conn.SetWriteDeadline(time.Time{})
-	if err != nil {
+	defer conn.SetWriteDeadline(time.Time{})
+	if err := writeAll(conn, frame); err != nil {
+		// A partial write desyncs the length-prefixed stream forever;
+		// the connection is unrecoverable — kill it so we reconnect
+		// onto a fresh, clean stream.
+		t.killConn(conn)
 		return fmt.Errorf("direct: write: %w", err)
 	}
 	t.RecordSend(len(data))
 	return nil
+}
+
+// writeAll writes the full frame: net.Conn.Write may legally return
+// n < len(p), and a partial write would permanently desync the
+// length-prefixed framing.
+func writeAll(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("zero-length write")
+		}
+	}
+	return nil
+}
+
+// killConn closes conn if it is still the active one and marks the
+// transport disconnected, so the dial/accept loops reconnect.
+func (t *DirectTransport) killConn(conn net.Conn) {
+	t.mu.Lock()
+	if t.conn == conn {
+		t.conn = nil
+		t.SetConnected(false)
+	}
+	t.mu.Unlock()
+	conn.Close()
 }
 
 // MaxPayload implements the session payloadCapacitor extension.
