@@ -48,6 +48,17 @@ var (
 // goroutine. A full queue applies backpressure to SendFrame callers.
 const sendQueueSize = 256
 
+// Capability bits exchanged in HELLO/HELLO_ACK (informational for now;
+// unknown bits are ignored for forward compatibility).
+const (
+	capHalfClose   byte = 1 << 0
+	capFlowControl byte = 1 << 1
+	capOFX1        byte = 1 << 2
+)
+
+// ourCapabilities is what this build supports.
+const ourCapabilities = capHalfClose | capFlowControl | capOFX1
+
 // payloadCapacitor is an optional Transport extension for carriers that
 // know their payload budget.
 type payloadCapacitor interface {
@@ -90,6 +101,9 @@ type Session struct {
 	// delivering a valid encrypted frame (exit side only).
 	confirmCh   chan struct{}
 	confirmOnce sync.Once
+
+	// peerCaps holds the peer's capability bits (0 if none/legacy).
+	peerCaps atomic.Uint32
 }
 
 // New creates a session over the transport. With a non-nil PSK the
@@ -272,8 +286,9 @@ func (s *Session) Handshake() error {
 	if s.isClient {
 		var payload []byte
 		if s.psk != nil {
-			// [role byte][32-byte ephemeral X25519 public key]
+			// [role byte][32-byte ephemeral X25519 public key][caps]
 			payload = append([]byte{roleByte(true)}, s.priv.PublicKey().Bytes()...)
+			payload = append(payload, ourCapabilities)
 		} else {
 			payload = make([]byte, 8)
 			binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
@@ -378,8 +393,8 @@ func (s *Session) dispatch(f wire.Frame) {
 			return
 		}
 		if s.psk != nil {
-			// Payload: [role byte][32-byte ephemeral X25519 public key].
-			if len(f.Payload) != 33 {
+			// Payload: [role][32-byte pubkey][optional caps byte].
+			if len(f.Payload) != 33 && len(f.Payload) != 34 {
 				s.failHello(fmt.Errorf("bad HELLO length %d", len(f.Payload)))
 				return
 			}
@@ -387,7 +402,10 @@ func (s *Session) dispatch(f wire.Frame) {
 				s.failHello(ErrRoleConflict)
 				return
 			}
-			peerPub := f.Payload[1:]
+			if len(f.Payload) == 34 {
+				s.peerCaps.Store(uint32(f.Payload[33]))
+			}
+			peerPub := f.Payload[1:33]
 			c, err := deriveSession(s.psk, s.priv, peerPub, s.isClient)
 			if err != nil {
 				s.failHello(err)
@@ -395,7 +413,8 @@ func (s *Session) dispatch(f wire.Frame) {
 			}
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
 			tag := c.computeKeyConfirm(clientPub, serverPub)
-			ackPayload := append(append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...), tag...)
+			// [role][pubkey][caps][tag]
+			ackPayload := append(append(append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...), ourCapabilities), tag...)
 			// HELLO_ACK must leave in plaintext: the client derives keys
 			// from it. Enqueued before crypto is enabled, and the writer
 			// preserves order.
@@ -420,8 +439,8 @@ func (s *Session) dispatch(f wire.Frame) {
 			if s.crypto.Load() != nil {
 				return // duplicate HELLO_ACK
 			}
-			// [role][server pubkey][key confirmation tag]
-			if len(f.Payload) != 1+32+keyConfirmTagLen {
+			// [role][server pubkey][optional caps][key confirmation tag]
+			if len(f.Payload) != 1+32+keyConfirmTagLen && len(f.Payload) != 1+32+1+keyConfirmTagLen {
 				s.failHello(fmt.Errorf("bad HELLO_ACK length %d", len(f.Payload)))
 				return
 			}
@@ -430,13 +449,18 @@ func (s *Session) dispatch(f wire.Frame) {
 				return
 			}
 			peerPub := f.Payload[1:33]
+			tagOffset := 33
+			if len(f.Payload) == 1+32+1+keyConfirmTagLen {
+				s.peerCaps.Store(uint32(f.Payload[33]))
+				tagOffset = 34
+			}
 			c, err := deriveSession(s.psk, s.priv, peerPub, s.isClient)
 			if err != nil {
 				s.failHello(err)
 				return
 			}
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
-			if !c.verifyKeyConfirm(clientPub, serverPub, f.Payload[33:]) {
+			if !c.verifyKeyConfirm(clientPub, serverPub, f.Payload[tagOffset:]) {
 				s.failHello(errors.New("key confirmation failed (PSK mismatch?)"))
 				return
 			}

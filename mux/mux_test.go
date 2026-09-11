@@ -445,6 +445,49 @@ func TestConcurrentStreamsEncrypted(t *testing.T) {
 	}
 }
 
+// TestOpenRateLimit fires 300 OPENs in a row (burst is 256): the
+// limiter must reject the excess with "rate limited" and nothing must
+// panic or wedge.
+func TestOpenRateLimit(t *testing.T) {
+	cm, sm := newMuxPair(t)
+
+	// Accept and hold every stream that passes the limiter.
+	go func() {
+		for {
+			st, err := sm.Accept()
+			if err != nil {
+				return
+			}
+			st.AcceptOpen()
+		}
+	}()
+
+	const total = 300
+	var succeeded, rateLimited int
+	for i := 0; i < total; i++ {
+		st, err := cm.Open("example.com", 80)
+		if err != nil {
+			if strings.Contains(err.Error(), "rate limited") {
+				rateLimited++
+				continue
+			}
+			t.Fatalf("unexpected Open error: %v", err)
+		}
+		succeeded++
+		defer st.Close()
+	}
+
+	if rateLimited == 0 {
+		t.Fatalf("%d rapid OPENs did not trigger the rate limiter (burst %d)", total, openRateBurst)
+	}
+	// Upper bound with generous slack for refill on slow machines
+	// (up to ~1s of refill on top of the burst).
+	if succeeded > openRateBurst+openRateLimit {
+		t.Fatalf("limiter let %d/%d OPENs through (burst %d)", succeeded, total, openRateBurst)
+	}
+	t.Logf("rate limiter: %d accepted, %d rejected", succeeded, rateLimited)
+}
+
 func TestDialTCPAdapter(t *testing.T) {
 	cm, sm := newMuxPair(t)
 	go echoAcceptor(t, sm)

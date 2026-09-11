@@ -38,11 +38,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go mod verify
+        run: go mod verify
+
       - name: build
         run: go build -v ./...
 
       - name: test
-        run: go test ./...
+        run: go test -shuffle=on -count=2 ./...
 
       - name: test (race detector)
         if: runner.os == 'Linux'

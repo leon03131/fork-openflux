@@ -27,6 +27,7 @@ type FaultyTransport struct {
 	DropProb    float64
 	DupProb     float64
 	CorruptProb float64
+	started     bool
 
 	// DisconnectAfterN, when >= 0, severs the link after N messages
 	// were delivered to the peer: SetConnected(false) is latched and
@@ -81,6 +82,13 @@ func NewFaultyPair(config TransportConfig) (*FaultyTransport, *FaultyTransport) 
 }
 
 func (f *FaultyTransport) Start() error {
+	f.mu.Lock()
+	if f.started {
+		f.mu.Unlock()
+		return errors.New("faulty: already started")
+	}
+	f.started = true
+	f.mu.Unlock()
 	if err := f.BaseTransport.Start(); err != nil {
 		return err
 	}

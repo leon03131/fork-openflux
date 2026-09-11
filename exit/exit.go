@@ -16,9 +16,15 @@ import (
 	"github.com/leon03131/fork-openflux/wire"
 )
 
+// maxConcurrentDials bounds how many destination dials may run at once;
+// excess streams are rejected so an OPEN flood to slow destinations
+// cannot exhaust the exit's FDs and goroutines.
+const maxConcurrentDials = 64
+
 type Server struct {
 	mux       *mux.Mux
 	dialer    net.Dialer
+	dialSem   chan struct{}
 	watchOnce sync.Once
 }
 
@@ -27,7 +33,8 @@ func NewServer(m *mux.Mux) *Server {
 		mux: m,
 		// Deliberately smaller than mux.OpenTimeout (25s): the client
 		// must get OPEN_ERROR, not a timeout, on slow destinations.
-		dialer: net.Dialer{Timeout: 10 * time.Second},
+		dialer:  net.Dialer{Timeout: 10 * time.Second},
+		dialSem: make(chan struct{}, maxConcurrentDials),
 	}
 }
 
@@ -73,7 +80,16 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 		case <-dialCtx.Done():
 		}
 	}()
+	// Cap concurrent dials. Non-blocking: the peer gets an immediate
+	// rejection instead of queueing behind slow dials.
+	select {
+	case s.dialSem <- struct{}{}:
+	default:
+		st.RejectOpen("exit busy")
+		return
+	}
 	conn, err := s.dialer.DialContext(dialCtx, "tcp", addr)
+	<-s.dialSem // the slot is held only for the dial itself
 	if err != nil {
 		utils.Debugf("[EXIT] dial %s failed: %v", addr, err)
 		// Do not leak internal dial errors (they map the exit's

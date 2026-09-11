@@ -16,6 +16,7 @@ type MemoryTransport struct {
 	peer    *MemoryTransport
 	inbound chan []byte
 	done    chan struct{}
+	started bool
 }
 
 // NewMemoryTransportPair creates two connected endpoints.
@@ -39,6 +40,13 @@ func NewMemoryTransportPair(config TransportConfig) (*MemoryTransport, *MemoryTr
 func (m *MemoryTransport) MaxPayload() int { return 256 * 1024 }
 
 func (m *MemoryTransport) Start() error {
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return errors.New("memory: already started")
+	}
+	m.started = true
+	m.mu.Unlock()
 	if err := m.BaseTransport.Start(); err != nil {
 		return err
 	}

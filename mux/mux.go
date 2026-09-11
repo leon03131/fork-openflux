@@ -47,6 +47,11 @@ const (
 	// MaxSessionBuffer bounds the total unread stream data buffered
 	// across the mux (all streams combined).
 	MaxSessionBuffer = 64 << 20 // 64 MiB
+
+	// openRateLimit/openRateBurst bound how fast the PEER may send OPEN
+	// frames (token bucket): flood protection for the accept path.
+	openRateLimit = 128 // OPENs per second
+	openRateBurst = 256
 )
 
 var (
@@ -75,6 +80,9 @@ type Mux struct {
 	acceptCh  chan *Stream
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// openRate throttles inbound OPEN frames (see handleOpen).
+	openRate *tokenBucket
 }
 
 // NewClientMux allocates odd stream IDs.
@@ -90,6 +98,7 @@ func newMux(s *session.Session, firstID uint32) *Mux {
 		nextID:   firstID,
 		acceptCh: make(chan *Stream, maxPendingAccepts),
 		closed:   make(chan struct{}),
+		openRate: newTokenBucket(openRateLimit, openRateBurst),
 	}
 	s.OnFrame(m.handleFrame)
 	// If the session dies, the mux must die too: wake all blocked
@@ -269,6 +278,13 @@ func (m *Mux) handleOpen(f wire.Frame) {
 		m.send(wire.Frame{Type: wire.TypeOpenError, StreamID: f.StreamID, Payload: []byte(reason)})
 	}
 
+	// OPEN flood protection: reject excess OPENs before spending any
+	// work on validation/allocation.
+	if !m.openRate.allow() {
+		reject("rate limited")
+		return
+	}
+
 	// Stream 0 is reserved for session-level frames; the peer must use
 	// IDs of ITS parity (clients odd, servers even) — enforced on BOTH
 	// sides, so a rogue/buggy peer can't collide with our namespace.
@@ -317,6 +333,42 @@ func (m *Mux) handleOpen(f wire.Frame) {
 		st.closeNoSend()
 		m.send(wire.Frame{Type: wire.TypeOpenError, StreamID: f.StreamID, Payload: []byte(ErrTooManyOpens.Error())})
 	}
+}
+
+// tokenBucket is a minimal dependency-free rate limiter: tokens refill
+// at a fixed rate up to a burst cap; each allowed event consumes one.
+type tokenBucket struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+	rate   float64 // tokens per second
+	burst  float64
+}
+
+func newTokenBucket(rate, burst int) *tokenBucket {
+	return &tokenBucket{
+		tokens: float64(burst),
+		last:   time.Now(),
+		rate:   float64(rate),
+		burst:  float64(burst),
+	}
+}
+
+// allow reports whether one event is permitted right now.
+func (b *tokenBucket) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() * b.rate
+	if b.tokens > b.burst {
+		b.tokens = b.burst
+	}
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }
 
 // --- Stream ---

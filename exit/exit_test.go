@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,48 @@ import (
 	"github.com/leon03131/fork-openflux/session"
 	"github.com/leon03131/fork-openflux/transport"
 )
+
+// newExitPair returns a connected client mux / exit mux pair over
+// in-process sessions.
+func newExitPair(t *testing.T) (*mux.Mux, *mux.Mux) {
+	t.Helper()
+	ta, tb := transport.NewMemoryTransportPair(transport.DefaultConfig())
+	if err := ta.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := session.New(ta, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := session.New(tb, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sa.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- sa.Handshake() }()
+	if err := sb.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	cm := mux.NewClientMux(sa)
+	em := mux.NewServerMux(sb)
+	t.Cleanup(func() {
+		cm.Close()
+		em.Close()
+	})
+	return cm, em
+}
 
 // TestExitEndToEnd runs the full v2 pipeline in-process:
 //
@@ -80,5 +123,52 @@ func TestExitEndToEnd(t *testing.T) {
 	}
 	if !bytes.Equal(buf, msg) {
 		t.Fatal("echo mismatch")
+	}
+}
+
+// TestExitDialCap fills the dial semaphore to simulate maxConcurrentDials
+// dials already in flight: the next stream must be rejected with
+// "exit busy". Once the slots are freed, dials must go through again.
+func TestExitDialCap(t *testing.T) {
+	clientMux, exitMux := newExitPair(t)
+
+	srv := NewServer(exitMux)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Occupy every dial slot.
+	for i := 0; i < maxConcurrentDials; i++ {
+		srv.dialSem <- struct{}{}
+	}
+
+	go func() {
+		for {
+			st, err := exitMux.Accept()
+			if err != nil {
+				return
+			}
+			go srv.handle(ctx, st)
+		}
+	}()
+
+	_, err := clientMux.Open("127.0.0.1", 1)
+	if err == nil {
+		t.Fatal("Open must be rejected when all dial slots are busy")
+	}
+	if !strings.Contains(err.Error(), "exit busy") {
+		t.Fatalf("expected \"exit busy\" rejection, got: %v", err)
+	}
+
+	// Free the slots: the next OPEN must pass the semaphore and fail at
+	// the real dial instead (nothing listens on the port).
+	for i := 0; i < maxConcurrentDials; i++ {
+		<-srv.dialSem
+	}
+	_, err = clientMux.Open("127.0.0.1", 1)
+	if err == nil {
+		t.Fatal("Open to a closed port must fail")
+	}
+	if !strings.Contains(err.Error(), "dial failed") {
+		t.Fatalf("expected \"dial failed\" rejection, got: %v", err)
 	}
 }
