@@ -81,15 +81,21 @@ v2 **требует** общий секрет (`--psk` / `OPENFLUX_PSK`) — с�
 
 ### Быстрый старт v2 (рекомендуется)
 
+Сгенерируйте ОДИН ключ и скопируйте его на обе машины:
+```bash
+openssl rand -base64 32
+# -> например "kX7...=="
+```
+
 Выходная нода (любой Linux, без root):
 ```bash
-export OPENFLUX_PSK="$(openssl rand -base64 32)"
+export OPENFLUX_PSK='kX7...=='   # ОДИНАКОВЫЙ ключ на обеих сторонах
 ./openflux exit --transport yandex --url "YOUR_YANDEX_DOC_URL"
 ```
 
 Клиент:
 ```bash
-export OPENFLUX_PSK="$(openssl rand -base64 32)"
+export OPENFLUX_PSK='kX7...=='   # то же значение, что и на ноде
 ./openflux client --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
 ```
 
@@ -100,8 +106,8 @@ export OPENFLUX_PSK="$(openssl rand -base64 32)"
 carrier `direct` (чистый TCP):
 
 ```bash
-./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk $env:OPENFLUX_PSK
-./openflux client --transport direct --addr EXIT_IP:9000 --psk $env:OPENFLUX_PSK
+./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk "$OPENFLUX_PSK"
+./openflux client --transport direct --addr EXIT_IP:9000 --psk "$OPENFLUX_PSK"
 ```
 
 Диагностика: `./openflux doctor --transport ...` — проверка конфигурации

@@ -81,15 +81,21 @@ Passphrases are rejected (they are offline-bruteforceable). The
 
 ### v2 quickstart (recommended)
 
+Generate ONE key and copy it to both machines:
+```bash
+openssl rand -base64 32
+# -> e.g. "kX7...=="
+```
+
 Exit node (any Linux box, no root):
 ```bash
-export OPENFLUX_PSK="$(openssl rand -base64 32)"
+export OPENFLUX_PSK='kX7...=='   # the SAME key on both sides
 ./openflux exit --transport yandex --url "YOUR_YANDEX_DOC_URL"
 ```
 
 Client:
 ```bash
-export OPENFLUX_PSK="$(openssl rand -base64 32)"
+export OPENFLUX_PSK='kX7...=='   # identical value as on the exit node
 ./openflux client --transport yandex --url "YOUR_YANDEX_DOC_URL" --socks5 127.0.0.1:1080
 ```
 
@@ -100,8 +106,8 @@ For local testing without third-party services there is a reference
 `direct` carrier (plain TCP):
 
 ```bash
-./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk $env:OPENFLUX_PSK
-./openflux client --transport direct --addr EXIT_IP:9000 --psk $env:OPENFLUX_PSK
+./openflux exit   --transport direct --addr 0.0.0.0:9000 --psk "$OPENFLUX_PSK"
+./openflux client --transport direct --addr EXIT_IP:9000 --psk "$OPENFLUX_PSK"
 ```
 
 Diagnostics: `./openflux doctor --transport ... ` checks config and
