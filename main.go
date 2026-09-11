@@ -25,6 +25,7 @@ import (
 	"github.com/leon03131/fork-openflux/session"
 	"github.com/leon03131/fork-openflux/socks5"
 	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/transport/mail"
 	"github.com/leon03131/fork-openflux/transport/oneme"
 	"github.com/leon03131/fork-openflux/transport/onlyoffice"
 	"github.com/leon03131/fork-openflux/transport/yandex"
@@ -84,9 +85,9 @@ func run() error {
 	flag.BoolVar(&cfg.exitNode, "exit-node", false, "Run as exit node")
 	flag.BoolVar(&cfg.debug, "debug", false, "Enable verbose debug logging")
 	flag.StringVar(&cfg.socksAddr, "socks5", "127.0.0.1:1080", "SOCKS5 listen address")
-	flag.StringVar(&cfg.transportType, "transport", "yandex", "Transport type (yandex, onlyoffice, oneme, direct)")
+	flag.StringVar(&cfg.transportType, "transport", "yandex", "Transport type (yandex, onlyoffice, mail, oneme, direct)")
 	flag.StringVar(&cfg.mode, "mode", "v2", "Protocol mode (v2 = stream mux, legacy = gVisor packet tunnel)")
-	flag.StringVar(&cfg.docURL, "url", "", "Document URL (yandex/onlyoffice transports)")
+	flag.StringVar(&cfg.docURL, "url", "", "Document URL (yandex/onlyoffice/mail transports)")
 	flag.StringVar(&cfg.maxToken, "maxToken", "", "MAX Web token (oneme transport)")
 	flag.StringVar(&cfg.maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	flag.StringVar(&cfg.addr, "addr", "", "Address for direct transport (client: exit address; exit: listen address)")
@@ -179,6 +180,11 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 			return nil, fmt.Errorf("--url is required for the onlyoffice transport (Yandex Disk document URL)")
 		}
 		trans = onlyoffice.NewOnlyOfficeTransport(cfg.docURL, config)
+	case "mail":
+		if cfg.docURL == "" {
+			return nil, fmt.Errorf("--url is required for the mail transport (Mail.ru Cloud public document URL)")
+		}
+		trans = mail.NewMailTransport(cfg.docURL, config)
 	case "oneme":
 		uidint, err := strconv.ParseInt(cfg.maxUid, 10, 64)
 		if err != nil {
@@ -410,6 +416,18 @@ func runDoctor(cfg *cliConfig) error {
 		}
 		check("onlyoffice doc config fetch", nil)
 		check("onlyoffice live handshake", onlyoffice.CheckLive(cfg.docURL))
+	case "mail":
+		if cfg.docURL == "" {
+			check("--url present", flagMissing("not set"))
+			break
+		}
+		check("--url present", nil)
+		if err := mail.CheckDoc(cfg.docURL); err != nil {
+			check("mail doc config fetch", err)
+			break
+		}
+		check("mail doc config fetch", nil)
+		check("mail live handshake", mail.CheckLive(cfg.docURL))
 	case "oneme":
 		if cfg.maxToken == "" {
 			check("--maxToken present", flagMissing("not set"))
