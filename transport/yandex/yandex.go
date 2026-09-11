@@ -475,6 +475,8 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 type clientConfigDoc struct {
 	OfficeActionData struct {
 		BalancerURL  string `json:"balancer_url"`
+		EditorType   string `json:"office_online_editor_type"`
+		OfficeType   string `json:"officeType"`
 		EditorConfig *struct {
 			Token    string `json:"token"`
 			Document struct {
@@ -547,6 +549,15 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		return YandexDocsInfo{}, fmt.Errorf("client-config missing required fields (provider schema changed?)")
 	}
 
+	// This transport speaks the LEGACY Yandex Docs editor protocol.
+	// Public/anonymous documents are now served by OnlyOffice, which
+	// accepts the websocket and then closes it with 1005.
+	et := config.OfficeActionData.EditorType + "/" + config.OfficeActionData.OfficeType
+	if strings.Contains(et, "onlyoffice") || strings.Contains(et, "only_office") ||
+		strings.Contains(config.OfficeActionData.BalancerURL, "onlyoffice") {
+		return YandexDocsInfo{}, fmt.Errorf("document uses the OnlyOffice editor (%s); this carrier needs the LEGACY Yandex editor (disable 'Перейти на новый редактор' on docs.yandex.ru and recreate the document)", et)
+	}
+
 	balancerURL := config.OfficeActionData.BalancerURL
 	host := strings.TrimPrefix(balancerURL, "https://")
 	document := ec.Document
@@ -597,4 +608,53 @@ func CheckDoc(url string) error {
 	t := NewYandexDocsTransport(url, transport.DefaultConfig())
 	_, err := t.fetchDocInfo(url, "doctor000")
 	return err
+}
+
+// CheckLive goes further than CheckDoc: it actually dials the provider
+// websocket and performs the auth handshake, verifying the server does
+// not immediately close the connection (the OnlyOffice symptom).
+func CheckLive(url string) error {
+	t := NewYandexDocsTransport(url, transport.DefaultConfig())
+	info, err := t.fetchDocInfo(url, "doctor000")
+	if err != nil {
+		return err
+	}
+
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	headers := http.Header{}
+	headers.Set("User-Agent", "Mozilla/5.0")
+	headers.Set("Origin", info.Origin)
+	headers.Set("Cookie", info.CookieStr)
+	headers.Set("Host", info.Host)
+
+	conn, _, err := dialer.Dial(info.WsURL, headers)
+	if err != nil {
+		return fmt.Errorf("websocket dial: %w", err)
+	}
+	defer conn.Close()
+
+	// Same auth sequence as the real transport.
+	tokenJSON, _ := json.Marshal(info.Token)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`40{"token":%s}`, tokenJSON))); err != nil {
+		return fmt.Errorf("auth write: %w", err)
+	}
+	authData := map[string]interface{}{
+		"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
+		"user": map[string]interface{}{"id": "doctor000"}, "editorType": 0,
+		"lastOtherSaveTime": -1, "permissions": info.Permissions,
+		"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
+	}
+	messagePart, _ := json.Marshal([]interface{}{"message", authData})
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("42%s", messagePart))); err != nil {
+		return fmt.Errorf("auth write: %w", err)
+	}
+
+	// Any inbound message within the timeout means the provider accepted
+	// us. An immediate close = rejected.
+	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("provider closed the connection without answering (incompatible editor?): %w", err)
+	}
+	return nil
 }

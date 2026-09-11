@@ -386,7 +386,12 @@ func runDoctor(cfg *cliConfig) error {
 			break
 		}
 		check("--url present", nil)
-		check("yandex doc config fetch", yandex.CheckDoc(cfg.docURL))
+		if err := yandex.CheckDoc(cfg.docURL); err != nil {
+			check("yandex doc config fetch", err)
+			break
+		}
+		check("yandex doc config fetch", nil)
+		check("yandex live websocket handshake", yandex.CheckLive(cfg.docURL))
 	case "oneme":
 		if cfg.maxToken == "" {
 			check("--maxToken present", flagMissing("not set"))
