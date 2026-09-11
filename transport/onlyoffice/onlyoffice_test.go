@@ -1,15 +1,23 @@
 package onlyoffice
 
 import (
+	"os"
 	"testing"
 	"time"
 
 	"github.com/leon03131/fork-openflux/transport"
 )
 
-// liveDocURL is a public Yandex Disk document served by the OnlyOffice
-// editor, used for the live exchange test.
-const liveDocURL = "https://disk.yandex.ru/i/XqMY_GarArEoFA"
+// The live exchange test needs a real OnlyOffice document URL provided
+// via environment (never hardcode/share real links in the repo).
+var liveDocURL = os.Getenv("OPENFLUX_TEST_DOC_URL")
+
+func requireLiveDoc(t *testing.T) {
+	t.Helper()
+	if liveDocURL == "" {
+		t.Skip("set OPENFLUX_TEST_DOC_URL to run the live document test")
+	}
+}
 
 func waitConnected(t *testing.T, name string, tr *OnlyOfficeTransport, budget time.Duration) {
 	t.Helper()
@@ -29,6 +37,7 @@ func waitConnected(t *testing.T, name string, tr *OnlyOfficeTransport, budget ti
 // waitAuth until the other unlocks (instant when both are this transport)
 // or until the 30s server lock timer fires (stale lock holder).
 func TestLiveDocExchange(t *testing.T) {
+	requireLiveDoc(t)
 	cfg := transport.DefaultConfig()
 	a := NewOnlyOfficeTransport(liveDocURL, cfg)
 	b := NewOnlyOfficeTransport(liveDocURL, cfg)
