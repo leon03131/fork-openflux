@@ -1,6 +1,7 @@
 package oneme
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,10 +17,13 @@ const (
 )
 
 func NewMaxClient() *MaxClient {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &MaxClient{
 		deviceID:      genUUID(),
 		keepaliveStop: make(chan struct{}),
 		closedCh:      make(chan struct{}),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -34,8 +38,11 @@ func (c *MaxClient) Connect() error {
 	header := http.Header{}
 	header.Set("Origin", "https://web.max.ru")
 	header.Set("User-Agent", USER_AGENT)
-	conn, _, err := websocket.DefaultDialer.Dial(WS_HOST, header)
+	conn, _, err := websocket.DefaultDialer.DialContext(c.ctx, WS_HOST, header)
 	if err != nil {
+		if c.ctx.Err() != nil {
+			return fmt.Errorf("client closed")
+		}
 		return err
 	}
 	c.mu.Lock()
@@ -195,6 +202,7 @@ func (c *MaxClient) Supervise(token string) {
 // Close terminates the client and all its goroutines.
 func (c *MaxClient) Close() {
 	c.closeOnce.Do(func() {
+		c.cancel() // abort any in-flight dial
 		close(c.keepaliveStop)
 		close(c.closedCh)
 		c.mu.Lock()

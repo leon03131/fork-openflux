@@ -143,13 +143,14 @@ func TestDisconnectDuringHelloAck(t *testing.T) {
 
 // TestDisconnectDuringConfirmation severs the EXIT carrier right after
 // its HELLO_ACK (DisconnectAfterN=1 on the exit side: HELLO_ACK is the
-// first and last message it delivers). The client completes its side of
-// the handshake, but its encrypted confirmation PING never reaches the
-// exit side, which must fail with a peer confirmation timeout.
+// first and last message it delivers). The client's confirmation PING
+// never reaches the exit side, so neither side becomes Ready: the exit
+// times out waiting for the client's proof, and the client times out
+// waiting for the exit's encrypted PONG. Mutual confirmation is fully
+// enforced.
 //
-// Slow: ~15s (HelloTimeout on the exit side; the client returns
-// immediately). session.go is not modified, so the test really waits
-// out the full confirmation timeout.
+// Slow: ~15s (HelloTimeout on both sides). session.go is not modified,
+// so the test really waits out the full confirmation timeout.
 func TestDisconnectDuringConfirmation(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
 	tb.DisconnectAfterN = 1 // exit link dies right after HELLO_ACK
@@ -158,16 +159,14 @@ func TestDisconnectDuringConfirmation(t *testing.T) {
 	errA, errB := handshakeAsync(sa, sb)
 	clientErr, exitErr := recvHandshakeErr(t, errA, errB)
 
-	// The client got its HELLO_ACK before the link died: it considers
-	// the handshake complete (its confirmation PING is fire-and-forget).
-	if clientErr != nil {
-		t.Fatalf("client handshake = %v, want nil (HELLO_ACK was delivered)", clientErr)
-	}
-	if exitErr == nil || !errors.Is(exitErr, ErrHandshake) {
-		t.Fatalf("exit handshake = %v, want ErrHandshake (confirmation timeout)", exitErr)
-	}
-	if !strings.Contains(exitErr.Error(), "confirmation") {
-		t.Fatalf("exit handshake = %v, want peer confirmation timeout", exitErr)
+	// Both sides must fail with a confirmation timeout.
+	for name, err := range map[string]error{"client": clientErr, "exit": exitErr} {
+		if err == nil || !errors.Is(err, ErrHandshake) {
+			t.Fatalf("%s handshake = %v, want ErrHandshake", name, err)
+		}
+		if !strings.Contains(err.Error(), "confirmation") {
+			t.Fatalf("%s handshake = %v, want confirmation timeout", name, err)
+		}
 	}
 	select {
 	case <-sb.Closed():

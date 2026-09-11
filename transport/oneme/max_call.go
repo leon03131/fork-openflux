@@ -1,6 +1,7 @@
 package oneme
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -157,6 +158,7 @@ func (h *CallHandler) signalingWriter() {
 // Close stops all CallHandler goroutines.
 func (h *CallHandler) Close() {
 	h.doneOnce.Do(func() {
+		h.cancel() // abort any in-flight dial
 		close(h.done)
 		h.mu.Lock()
 		if h.conn != nil {
@@ -562,6 +564,7 @@ func (h *CallHandler) handleCandidate(c map[string]interface{}) {
 
 func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h := &CallHandler{tag: "CALLER", role: "caller"}
+	h.ctx, h.cancel = context.WithCancel(context.Background())
 	h.seq = 1
 	h.reconnectCh = make(chan struct{}, 1)
 	h.msgCh = make(chan string, 1024)
@@ -641,7 +644,11 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			})
 			if err != nil {
 				logError("[CALLER] invoke error: %v, retrying...", err)
-				time.Sleep(1 * time.Second)
+				select {
+				case <-time.After(1 * time.Second):
+				case <-h.done:
+					return
+				}
 				continue
 			}
 			var payload map[string]interface{}
@@ -651,16 +658,27 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			json.Unmarshal([]byte(paramsStr), &params)
 			if params.Endpoint == "" {
 				logError("[CALLER] empty call endpoint, retrying...")
-				time.Sleep(1 * time.Second)
+				select {
+				case <-time.After(1 * time.Second):
+				case <-h.done:
+					return
+				}
 				continue
 			}
 
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
-			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
+			conn, _, err := websocket.DefaultDialer.DialContext(h.ctx, endpoint, nil)
 			if err != nil {
+				if h.ctx.Err() != nil {
+					return
+				}
 				// Dial errors may embed the URL with credentials.
 				logError("[CALLER] Dial error: %v, retrying...", redactEndpointToken(err.Error()))
-				time.Sleep(1 * time.Second)
+				select {
+				case <-time.After(1 * time.Second):
+				case <-h.done:
+					return
+				}
 				continue
 			}
 			h.mu.Lock()
@@ -677,7 +695,11 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			}
 			h.setConnected(false)
 			logInfo("[CALLER] Reconnecting in 1s...")
-			time.Sleep(1 * time.Second)
+			select {
+			case <-time.After(1 * time.Second):
+			case <-h.done:
+				return
+			}
 		}
 	}()
 
@@ -686,6 +708,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 
 func startIncomingListener(client *MaxClient) *CallHandler {
 	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
+	h.ctx, h.cancel = context.WithCancel(context.Background())
 	h.seq = 1
 	h.msgCh = make(chan string, 1024)
 	h.outQueue = make(chan []byte, 1024)
@@ -734,8 +757,11 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			endpoint := craftEndpoint(convID, callDetails)
 			logInfo("[RECEIVER] Initial endpoint: %s", redactEndpointToken(endpoint))
 
-			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
+			conn, _, err := websocket.DefaultDialer.DialContext(h.ctx, endpoint, nil)
 			if err != nil {
+				if h.ctx.Err() != nil {
+					return
+				}
 				logError("[RECEIVER] Connect error: %v", redactEndpointToken(err.Error()))
 				return
 			}

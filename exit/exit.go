@@ -61,7 +61,17 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 	}
 
 	addr := wire.JoinHostPort(st.DestHost(), st.DestPort())
-	conn, err := s.dialer.DialContext(ctx, "tcp", addr)
+	// Cancel the dial if the stream dies mid-connect (CLOSE raced OPEN).
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-st.Done():
+			cancel()
+		case <-dialCtx.Done():
+		}
+	}()
+	conn, err := s.dialer.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		utils.Debugf("[EXIT] dial %s failed: %v", addr, err)
 		// Do not leak internal dial errors (they map the exit's

@@ -218,10 +218,11 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
+		// Fresh queue per connection: stale frames from a dead
+		// connection are poison for a new v2 session (old keys, old
+		// sequence numbers), and in legacy mode gVisor's TCP
+		// retransmission recovers losses anyway.
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
-		if existingSession != nil {
-			writeQueue = existingSession.WriteQueue
-		}
 
 		session := &DocSession{
 			Info:       info,

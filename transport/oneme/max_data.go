@@ -1,6 +1,7 @@
 package oneme
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,9 @@ type MaxClient struct {
 	closedCh      chan struct{}
 	closeOnce     sync.Once
 	onEvent       func(MaxPacket)
+	// ctx cancels any in-flight websocket dial; cancel is called by Close.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type CallHandler struct {
@@ -88,4 +92,7 @@ type CallHandler struct {
 	doneOnce sync.Once
 	// msgMu serializes msgHandler against resetCallState.
 	msgMu sync.Mutex
+	// ctx cancels any in-flight websocket dial; cancel is called by Close.
+	ctx    context.Context
+	cancel context.CancelFunc
 }

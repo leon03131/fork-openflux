@@ -280,24 +280,27 @@ func (s *Session) Handshake() error {
 	}
 	if s.psk != nil {
 		if s.isClient {
-			// Encrypted immediately: proves our keys to the peer at once.
+			// Prove our keys to the exit at once, then wait for its
+			// encrypted PONG: only then is the session mutually
+			// authenticated and Ready on both sides.
 			ping := make([]byte, 8)
 			binary.BigEndian.PutUint64(ping, uint64(time.Now().UnixNano()))
 			if err := s.SendFrame(wire.Frame{Type: wire.TypePing, Payload: ping}); err != nil {
-				utils.Debugf("[SESSION] confirmation ping failed: %v", err)
-			}
-		} else {
-			// The exit side is not Ready until the client confirms it
-			// knows the PSK (first valid encrypted frame).
-			select {
-			case <-s.confirmCh:
-			case <-time.After(HelloTimeout):
-				err := fmt.Errorf("%w: peer confirmation timeout", ErrHandshake)
 				s.CloseWithError(err)
-				return err
-			case <-s.closed:
-				return ErrClosed
+				return fmt.Errorf("%w: confirmation ping: %v", ErrHandshake, err)
 			}
+		}
+		// Both sides: Ready only after the peer proved PSK knowledge
+		// (first valid encrypted frame: client PING on exit, server PONG
+		// on client).
+		select {
+		case <-s.confirmCh:
+		case <-time.After(HelloTimeout):
+			err := fmt.Errorf("%w: peer confirmation timeout", ErrHandshake)
+			s.CloseWithError(err)
+			return err
+		case <-s.closed:
+			return ErrClosed
 		}
 	}
 	// From now on, loss of carrier connectivity kills the session; the
