@@ -17,7 +17,7 @@ Exit:    carrier -> session -> mux -> net.DialContext (NO root needed)
 - `mux/` — стримы net.Conn поверх сессии. Credit-based flow control (512 KiB/стрим), half-close. Client = нечётные stream ID, exit = чётные.
 - `exit/` — exit-нода v2: Accept → DialContext → relay с half-close.
 - `transport/` — Carrier-интерфейс (`Transport`), MemoryTransport (тесты), DirectTransport (reference, plain TCP), CompressedTransport (LZ4, только legacy).
-- `transport/yandex/`, `transport/oneme/` — экспериментальные carrier'ы (сторонние сервисы, схема может сломаться; весь внешний ввод — недоверенный, никаких паникующих type assertions).
+- `transport/yandex/`, `transport/oneme/`, `transport/onlyoffice/` — экспериментальные carrier'ы (сторонние сервисы, схема может сломаться; весь внешний ввод — недоверенный, никаких паникующих type assertions). `onlyoffice` — текущий редактор Яндекс.Документов для публичных ссылок (legacy `yandex` для них умер); курсорный канал поверх OnlyOffice Docs socket.io с обработкой waitAuth/unLockDocument (см. комментарии в onlyoffice.go).
 - `tunnel/`, `socks5/`, `network/` — legacy packet mode (gVisor + raw sockets) и SOCKS5-сервер (используется обоими режимами через интерфейс Dialer).
 
 Legacy-режим (`--mode legacy`) — исходный packet-tunnel через gVisor; v2 (`--mode v2`, дефолт) — stream-mux. Не удалять legacy без отдельного решения.
