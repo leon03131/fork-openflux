@@ -57,6 +57,17 @@ type BaseTransport struct {
 }
 
 func NewBaseTransport(config TransportConfig) *BaseTransport {
+	// Normalize obviously broken values instead of letting carriers
+	// panic later (e.g. time.NewTicker panics on interval <= 0).
+	if config.KeepAliveInterval <= 0 {
+		config.KeepAliveInterval = 10 * time.Second
+	}
+	if config.MaxQueueSize <= 0 {
+		config.MaxQueueSize = 1024
+	}
+	if config.ReconnectDelay <= 0 {
+		config.ReconnectDelay = 500 * time.Millisecond
+	}
 	return &BaseTransport{
 		config:    config,
 		startTime: time.Now(),
@@ -65,7 +76,6 @@ func NewBaseTransport(config TransportConfig) *BaseTransport {
 
 func (b *BaseTransport) Start() error {
 	b.running.Store(1)
-	b.startTime = time.Now()
 	return nil
 }
 

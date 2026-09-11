@@ -55,6 +55,10 @@ func (t *DirectTransport) Start() error {
 	if t.isExit {
 		listener, err := net.Listen("tcp", t.addr)
 		if err != nil {
+			// Allow Start to be retried after a failed listen.
+			t.mu.Lock()
+			t.started = false
+			t.mu.Unlock()
 			return fmt.Errorf("direct listen: %w", err)
 		}
 		t.mu.Lock()

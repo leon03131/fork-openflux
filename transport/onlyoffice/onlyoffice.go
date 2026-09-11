@@ -519,11 +519,26 @@ func (t *OnlyOfficeTransport) keepAliveLoop() {
 // history rewrite (deleteIndex=-1).
 const unLockDocumentMsg = `42["message",{"type":"unLockDocument","unlock":true,"isSave":false,"releaseLocks":false,"deleteIndex":-1}]`
 
+// writeOrKill writes a control message; on failure the connection is
+// closed so the reconnect chain kicks in (a half-broken socket must not
+// linger).
+func (t *OnlyOfficeTransport) writeOrKill(s *ooSession, msg string) {
+	if err := s.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+		utils.Debugf("[ONLYOFFICE] control write failed, closing conn: %v", err)
+		t.Mu.Lock()
+		if t.session == s {
+			t.SetConnected(false)
+			s.Conn.Close()
+		}
+		t.Mu.Unlock()
+	}
+}
+
 func (t *OnlyOfficeTransport) handleMessage(session *ooSession, text string) {
 	// Socket.IO ping/pong.
 	if text == "2" {
 		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
+			t.writeOrKill(session, "3")
 		}
 		return
 	}
@@ -554,7 +569,7 @@ func (t *OnlyOfficeTransport) handleMessage(session *ooSession, text string) {
 		}
 		if err := json.Unmarshal(body, &cs); err == nil && cs.WaitAuth {
 			utils.Debugf("[ONLYOFFICE] peer waiting on document lock, releasing")
-			session.safeWrite(websocket.TextMessage, []byte(unLockDocumentMsg))
+			t.writeOrKill(session, unLockDocumentMsg)
 		}
 	case "cursor":
 		if !session.ready {

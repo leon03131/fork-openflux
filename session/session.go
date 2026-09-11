@@ -399,10 +399,14 @@ func (s *Session) dispatch(f wire.Frame) {
 			// HELLO_ACK must leave in plaintext: the client derives keys
 			// from it. Enqueued before crypto is enabled, and the writer
 			// preserves order.
-			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: ackPayload})
+			if err := s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: ackPayload}); err != nil {
+				utils.Debugf("[SESSION] HELLO_ACK send failed: %v", err)
+			}
 			s.crypto.Store(c)
 		} else {
-			s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: f.Payload})
+			if err := s.SendFrame(wire.Frame{Type: wire.TypeHelloAck, Payload: f.Payload}); err != nil {
+				utils.Debugf("[SESSION] HELLO_ACK send failed: %v", err)
+			}
 		}
 		select {
 		case s.helloCh <- nil:
@@ -443,7 +447,9 @@ func (s *Session) dispatch(f wire.Frame) {
 		default:
 		}
 	case wire.TypePing:
-		s.SendFrame(wire.Frame{Type: wire.TypePong, Payload: f.Payload})
+		if err := s.SendFrame(wire.Frame{Type: wire.TypePong, Payload: f.Payload}); err != nil {
+			utils.Debugf("[SESSION] PONG send failed: %v", err)
+		}
 	case wire.TypePong:
 		if len(f.Payload) == 8 {
 			sent := time.Unix(0, int64(binary.BigEndian.Uint64(f.Payload)))
@@ -556,4 +562,13 @@ func (s *Session) Close() { s.CloseWithError(ErrClosed) }
 func (s *Session) Closed() <-chan struct{} { return s.closed }
 
 // Err reports why the session closed (nil while alive / clean Close).
-func (s *Session) Err() error { return s.closeErr }
+// Race-free: reading closeErr only after the closed channel fired gives
+// a happens-before edge (channel close synchronizes with the write).
+func (s *Session) Err() error {
+	select {
+	case <-s.closed:
+		return s.closeErr
+	default:
+		return nil
+	}
+}

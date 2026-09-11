@@ -7,6 +7,8 @@ import (
 	"io"
 
 	"github.com/pierrec/lz4/v4"
+
+	"github.com/leon03131/fork-openflux/utils"
 )
 
 const (
@@ -52,6 +54,7 @@ func (c *CompressedTransport) Receive(callback func([]byte)) {
 		if err != nil {
 			// Drop malformed frames instead of forwarding garbage
 			// into the network stack.
+			utils.Debugf("[COMPRESS] dropping malformed frame: %v", err)
 			return
 		}
 		callback(decompressed)

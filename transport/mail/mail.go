@@ -516,11 +516,25 @@ func (t *MailTransport) keepAliveLoop() {
 // history rewrite (deleteIndex=-1).
 const unLockDocumentMsg = `42["message",{"type":"unLockDocument","unlock":true,"isSave":false,"releaseLocks":false,"deleteIndex":-1}]`
 
+// writeOrKill writes a control message; on failure the connection is
+// closed so the reconnect chain kicks in.
+func (t *MailTransport) writeOrKill(s *mailSession, msg string) {
+	if err := s.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+		utils.Debugf("[MAIL] control write failed, closing conn: %v", err)
+		t.Mu.Lock()
+		if t.session == s {
+			t.SetConnected(false)
+			s.Conn.Close()
+		}
+		t.Mu.Unlock()
+	}
+}
+
 func (t *MailTransport) handleMessage(session *mailSession, text string) {
 	// Socket.IO ping/pong.
 	if text == "2" {
 		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
+			t.writeOrKill(session, "3")
 		}
 		return
 	}
@@ -551,7 +565,7 @@ func (t *MailTransport) handleMessage(session *mailSession, text string) {
 		}
 		if err := json.Unmarshal(body, &cs); err == nil && cs.WaitAuth {
 			utils.Debugf("[MAIL] peer waiting on document lock, releasing")
-			session.safeWrite(websocket.TextMessage, []byte(unLockDocumentMsg))
+			t.writeOrKill(session, unLockDocumentMsg)
 		}
 	case "cursor":
 		if !session.ready {
