@@ -6,10 +6,17 @@
 //
 // Data frames ride as OnlyOffice "cursor" messages:
 //
-//	42["message",{"type":"cursor","cursor":"18;<base64 payload>"}]
+//	42["message",{"type":"cursor","cursor":"18;OFX1<channelID>:<base64 payload>"}]
+//
+// The OFX1<channelID>: marker identifies frames belonging to this tunnel
+// pair; channelID is derived deterministically from the document URL
+// (first 8 hex chars of sha256), so both tunnel ends compute it without
+// negotiation. Cursors without our exact marker (real editors' cursor
+// positions, foreign sessions, stale garbage in the document) are
+// silently dropped before base64 decoding ever happens.
 //
 // The server relays them to every other participant as
-// {"type":"cursor","messages":[{"cursor":"18;<base64>","useridoriginal":...}]}.
+// {"type":"cursor","messages":[{"cursor":"18;OFX1<channelID>:<base64>","useridoriginal":...}]}.
 // The sender never receives its own cursor back (excluded server-side);
 // as defense in depth we additionally drop messages whose useridoriginal
 // matches the id the server assigned to us.
@@ -31,7 +38,10 @@
 package onlyoffice
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,6 +105,18 @@ type OnlyOfficeTransport struct {
 	url     string
 	session *ooSession
 
+	// ctx/cancel drive the whole transport lifecycle: cancel (called by
+	// Stop) aborts an in-flight websocket dial, pending reconnect timers
+	// and all background loops.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// framePrefix is the OFX1 protocol marker ("OFX1<channelID>:") that
+	// identifies our frames inside the cursor channel. Derived
+	// deterministically from the document URL, so both tunnel ends share
+	// it without negotiation. Immutable after construction.
+	framePrefix string
+
 	userCounter atomic.Int32
 	baseUserID  string
 
@@ -108,9 +130,13 @@ type OnlyOfficeTransport struct {
 func (t *OnlyOfficeTransport) MaxPayload() int { return 64 * 1024 }
 
 func NewOnlyOfficeTransport(url string, config transport.TransportConfig) *OnlyOfficeTransport {
+	ctx, cancel := context.WithCancel(context.Background())
 	t := &OnlyOfficeTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           url,
+		ctx:           ctx,
+		cancel:        cancel,
+		framePrefix:   framePrefixFor(url),
 	}
 	t.baseUserID = randUserID()
 	return t
@@ -129,12 +155,15 @@ func (t *OnlyOfficeTransport) Start() error {
 	return nil
 }
 
-// Stop shuts the transport down and closes the active websocket so the
-// read loop can actually exit (it would otherwise block in ReadMessage).
+// Stop shuts the transport down: it cancels the transport context
+// (aborting any in-flight dial, pending reconnect timer and the
+// background loops) and closes the active websocket so the read loop can
+// actually exit (it would otherwise block in ReadMessage). Idempotent.
 func (t *OnlyOfficeTransport) Stop() error {
 	if err := t.BaseTransport.Stop(); err != nil {
 		return err
 	}
+	t.cancel()
 	t.Mu.RLock()
 	session := t.session
 	t.Mu.RUnlock()
@@ -159,7 +188,6 @@ func (t *OnlyOfficeTransport) Send(data []byte) error {
 
 	select {
 	case session.WriteQueue <- data:
-		t.RecordSend(len(data))
 		return nil
 	default:
 		return fmt.Errorf("write queue full")
@@ -190,6 +218,9 @@ func (t *OnlyOfficeTransport) connectToDoc(attempt int) {
 
 		info, err := t.fetchDocInfo(t.url, userID)
 		if err != nil {
+			if t.ctx.Err() != nil {
+				return // Stop() fired mid-fetch
+			}
 			utils.Debugf("[ONLYOFFICE] fetchDocInfo failed: %v", err)
 			t.scheduleReconnect(attempt)
 			return
@@ -202,8 +233,11 @@ func (t *OnlyOfficeTransport) connectToDoc(attempt int) {
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
 
-		conn, _, err := dialer.Dial(info.WsURL, headers)
+		conn, _, err := dialer.DialContext(t.ctx, info.WsURL, headers)
 		if err != nil {
+			if t.ctx.Err() != nil {
+				return // Stop() fired mid-dial
+			}
 			utils.Debugf("[ONLYOFFICE] WebSocket dial failed: %v", err)
 			t.scheduleReconnect(attempt)
 			return
@@ -394,22 +428,26 @@ func (t *OnlyOfficeTransport) handshake(s *ooSession) error {
 }
 
 func (t *OnlyOfficeTransport) writerLoop() {
-	for t.IsRunning() {
+	for {
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
 
 		if session == nil || session.Conn == nil {
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-t.ctx.Done():
+				return
+			}
 			continue
 		}
 
 		select {
 		case packet := <-session.WriteQueue:
-			payload := base64.StdEncoding.EncodeToString(packet)
-			msg := `42["message",{"type":"cursor","cursor":"18;` + payload + `"}]`
+			msg := `42["message",{"type":"cursor","cursor":"` + encodeCursor(t.framePrefix, packet) + `"}]`
 
-			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+			err := session.safeWrite(websocket.TextMessage, []byte(msg))
+			if err != nil {
 				utils.Debugf("[ONLYOFFICE] Write error: %v", err)
 				// A failed write means the connection is broken:
 				// close it so the read loop wakes and reconnects.
@@ -419,9 +457,15 @@ func (t *OnlyOfficeTransport) writerLoop() {
 					session.Conn.Close()
 				}
 				t.Mu.Unlock()
+			} else {
+				// Count only bytes actually written to the socket, not
+				// merely queued.
+				t.RecordSend(len(packet))
 			}
 		case <-time.After(250 * time.Millisecond):
-			// Periodic wake-up to re-check IsRunning and session.
+			// Periodic wake-up to re-check the session.
+		case <-t.ctx.Done():
+			return
 		}
 	}
 }
@@ -435,8 +479,13 @@ func (t *OnlyOfficeTransport) keepAliveLoop() {
 	defer ticker.Stop()
 	extendMsg := `42["message",{"type":"extendSession","idletime":0}]`
 
-	for t.IsRunning() {
-		<-ticker.C
+	for {
+		select {
+		case <-ticker.C:
+		case <-t.ctx.Done():
+			return
+		}
+
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
@@ -521,7 +570,7 @@ func (t *OnlyOfficeTransport) handleMessage(session *ooSession, text string) {
 			if session.myIDOriginal != "" && m.UserIDOriginal == session.myIDOriginal {
 				continue
 			}
-			payload, ok := decodeCursor(m.Cursor)
+			payload, ok := decodeCursor(m.Cursor, t.framePrefix)
 			if !ok {
 				continue
 			}
@@ -535,16 +584,38 @@ func (t *OnlyOfficeTransport) handleMessage(session *ooSession, text string) {
 	}
 }
 
+// framePrefixFor derives the OFX1 protocol marker for a document URL.
+// The channel id is deterministic (first 8 hex chars of sha256(url)), so
+// the client and the exit — configured with the same document URL —
+// compute the same marker without any negotiation.
+func framePrefixFor(docURL string) string {
+	sum := sha256.Sum256([]byte(docURL))
+	return "OFX1" + hex.EncodeToString(sum[:])[:8] + ":"
+}
+
+// encodeCursor wraps a payload into the wire cursor form
+// "18;OFX1<channelID>:<base64>". The "18;" cursor-index prefix keeps the
+// frame looking like an ordinary editor cursor to the relay server.
+func encodeCursor(framePrefix string, payload []byte) string {
+	return "18;" + framePrefix + base64.StdEncoding.EncodeToString(payload)
+}
+
 // decodeCursor extracts the payload from a cursor string of the form
-// "<index>;<base64>". Anything else (real editors' cursor positions)
-// fails validation and is ignored.
-func decodeCursor(cursor string) ([]byte, bool) {
+// "<index>;OFX1<channelID>:<base64>". Anything without our exact OFX1
+// marker — real editors' cursor positions, foreign or stale sessions,
+// random garbage — is silently dropped BEFORE base64 decoding, so it can
+// never reach the session layer as a decrypt failure.
+func decodeCursor(cursor, framePrefix string) ([]byte, bool) {
 	i := strings.IndexByte(cursor, ';')
 	if i < 0 || i+1 >= len(cursor) {
 		return nil, false
 	}
-	decoded, err := base64.StdEncoding.DecodeString(cursor[i+1:])
-	if err != nil {
+	rest := cursor[i+1:]
+	if !strings.HasPrefix(rest, framePrefix) {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rest[len(framePrefix):])
+	if err != nil || len(decoded) == 0 {
 		return nil, false
 	}
 	return decoded, true
@@ -604,9 +675,17 @@ func (t *OnlyOfficeTransport) scheduleReconnect(attempt int) {
 	delay = delay/2 + time.Duration(rand.Int63n(int64(delay/2)+1))
 
 	utils.Debugf("[ONLYOFFICE] Reconnect #%d in %v", attempt+1, delay)
-	time.AfterFunc(delay, func() {
-		t.connectToDoc(attempt + 1)
-	})
+	// The timer is tied to the transport context: Stop() cancels it
+	// immediately instead of letting a stale reconnect fire.
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			t.connectToDoc(attempt + 1)
+		case <-t.ctx.Done():
+		}
+	}()
 }
 
 // clientConfigDoc is the typed subset of the Yandex Disk "client-config"
@@ -661,7 +740,7 @@ func (t *OnlyOfficeTransport) fetchDocInfo(url, userID string) (docInfo, error) 
 		Timeout:       30 * time.Second,
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(t.ctx, "GET", url, nil)
 	if err != nil {
 		return docInfo{}, fmt.Errorf("bad document URL: %w", err)
 	}
@@ -800,7 +879,7 @@ func CheckLive(url string) error {
 	headers.Set("Cookie", info.CookieStr)
 	headers.Set("Host", info.Host)
 
-	conn, _, err := dialer.Dial(info.WsURL, headers)
+	conn, _, err := dialer.DialContext(t.ctx, info.WsURL, headers)
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
 	}

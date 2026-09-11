@@ -270,13 +270,19 @@ func (m *Mux) handleOpen(f wire.Frame) {
 	}
 
 	// Stream 0 is reserved for session-level frames; the peer must use
-	// IDs of ITS parity (clients odd, servers even).
+	// IDs of ITS parity (clients odd, servers even) — enforced on BOTH
+	// sides, so a rogue/buggy peer can't collide with our namespace.
 	if f.StreamID == 0 {
 		reject("stream id 0 is reserved")
 		return
 	}
-	peerIsClient := m.nextID%2 == 0 // we are the exit side
+	weAreExit := m.nextID%2 == 0
+	peerIsClient := weAreExit
 	if peerIsClient && f.StreamID%2 != 1 {
+		reject("bad stream id parity")
+		return
+	}
+	if !peerIsClient && f.StreamID%2 != 0 {
 		reject("bad stream id parity")
 		return
 	}

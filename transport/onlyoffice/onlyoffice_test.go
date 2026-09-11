@@ -1,7 +1,9 @@
 package onlyoffice
 
 import (
+	"bytes"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -92,26 +94,82 @@ func TestLiveDocExchange(t *testing.T) {
 	}
 }
 
+// TestFramePrefixFor checks the deterministic channel-marker derivation:
+// the same document URL must always yield the same marker (client and
+// exit compute it independently), different URLs must not collide.
+func TestFramePrefixFor(t *testing.T) {
+	const url = "https://disk.yandex.ru/i/example"
+	p1 := framePrefixFor(url)
+	if p1 != framePrefixFor(url) {
+		t.Fatal("framePrefixFor is not deterministic")
+	}
+	if framePrefixFor(url+"x") == p1 {
+		t.Fatal("different URLs must not share a channel marker")
+	}
+	if !strings.HasPrefix(p1, "OFX1") || !strings.HasSuffix(p1, ":") {
+		t.Errorf("bad marker shape: %q", p1)
+	}
+	if len(p1) != len("OFX1")+8+1 {
+		t.Errorf("bad marker length: %q", p1)
+	}
+}
+
+// TestEncodeDecodeCursorRoundtrip verifies that our own frames survive
+// the encode/decode roundtrip while frames with a foreign channel marker
+// are dropped.
+func TestEncodeDecodeCursorRoundtrip(t *testing.T) {
+	prefix := framePrefixFor("https://disk.yandex.ru/i/roundtrip")
+	payload := []byte{0x00, 0x01, 0x02, 0xfa, 0xff}
+
+	wire := encodeCursor(prefix, payload)
+	if !strings.HasPrefix(wire, "18;"+prefix) {
+		t.Fatalf("encodeCursor produced %q, want prefix %q", wire, "18;"+prefix)
+	}
+
+	got, ok := decodeCursor(wire, prefix)
+	if !ok {
+		t.Fatalf("decodeCursor(%q) rejected our own frame", wire)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("decodeCursor(%q) = %v, want %v", wire, got, payload)
+	}
+
+	// A peer with a different channel (or a stale marker) must not be
+	// able to feed us payloads.
+	if _, ok := decodeCursor(wire, "OFX1deadbeef:"); ok {
+		t.Error("decodeCursor accepted a frame with a foreign channel marker")
+	}
+}
+
 // TestDecodeCursor covers the cursor payload extraction on adversarial
-// input (untrusted wire data must never panic).
+// input (untrusted wire data must never panic, and anything without our
+// exact OFX1 marker must be silently dropped).
 func TestDecodeCursor(t *testing.T) {
+	const prefix = "OFX1deadbeef:"
 	cases := []struct {
 		in     string
 		want   string
 		wantOK bool
 	}{
-		{"18;aGVsbG8=", "hello", true},
-		{"0;AAECAw==", "\x00\x01\x02\x03", true},
+		{"18;OFX1deadbeef:aGVsbG8=", "hello", true},
+		{"0;OFX1deadbeef:AAECAw==", "\x00\x01\x02\x03", true},
+		{"999;OFX1deadbeef:aGVsbG8=", "hello", true}, // any cursor index is fine
+		{"18;OFX1cafebabe:aGVsbG8=", "", false},      // foreign channel
+		{"18;aGVsbG8=", "", false},                   // legacy format without marker
+		{"18;OFX1deadbeef:", "", false},              // empty payload
+		{"18;OFX1deadbeef:!!!not-base64!!!", "", false},
+		{"18;OFX1deadbeef:aGVsbG8", "", false}, // bad padding
+		{"18;OFX1deadbee:aGVsbG8=", "", false}, // truncated marker
+		{"18;OFX1deadbeefaGVsbG8=", "", false}, // missing ':' separator
+		{"OFX1deadbeef:aGVsbG8=", "", false},   // missing cursor index
 		{";", "", false},
 		{"18;", "", false},
 		{"no-separator", "", false},
 		{"", "", false},
-		{"18;!!!not-base64!!!", "", false},
-		{"18;aGVsbG8", "", false}, // bad padding
 	}
 
 	for _, c := range cases {
-		got, ok := decodeCursor(c.in)
+		got, ok := decodeCursor(c.in, prefix)
 		if ok != c.wantOK {
 			t.Errorf("decodeCursor(%q): ok=%v want %v", c.in, ok, c.wantOK)
 			continue
@@ -119,6 +177,25 @@ func TestDecodeCursor(t *testing.T) {
 		if ok && string(got) != c.want {
 			t.Errorf("decodeCursor(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestStopIdempotent verifies that Stop can be called twice and tears
+// down promptly even with no reachable document (the transport context
+// cancels the in-flight connect attempt and any pending reconnect).
+func TestStopIdempotent(t *testing.T) {
+	tr := NewOnlyOfficeTransport("https://127.0.0.1:1/unreachable", transport.DefaultConfig())
+	if err := tr.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := tr.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := tr.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	if tr.IsRunning() || tr.IsConnected() {
+		t.Error("transport still running/connected after Stop")
 	}
 }
 

@@ -15,9 +15,11 @@ Client side runs a SOCKS5 proxy; the exit node decapsulates and forwards
 traffic to the destination.
 
 Transports (carriers):
-1. **yandex** — packets via Yandex Docs cursor messages;
-2. **oneme** — packets disguised as WebRTC ICE candidates over MAX call signaling;
-3. **direct** — plain TCP reference carrier (local testing/debugging).
+1. **onlyoffice** — packets via cursor messages of the current Yandex Docs (OnlyOffice) editor;
+2. **mail** — packets via cursor messages of Mail.ru Cloud documents (R7-Office);
+3. **direct** — plain TCP reference carrier (fast, needs a reachable exit port);
+4. **oneme** — packets disguised as WebRTC ICE candidates over MAX call signaling (experimental);
+5. **yandex** — legacy Yandex Docs editor carrier (deprecated: provider migrated).
 
 ## Requirements
 1. Golang v. 1.26.4+ - is required for building desktop client / exit node binary;

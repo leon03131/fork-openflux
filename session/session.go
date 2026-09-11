@@ -202,6 +202,16 @@ func (s *Session) writerLoop() {
 	for {
 		select {
 		case msg := <-s.sendQueue:
+			// A fatal close must not leave the writer sending dead
+			// generation frames: select may still pick the queue over
+			// the closed channel.
+			select {
+			case <-s.closed:
+				if s.closeErr != ErrClosed {
+					return
+				}
+			default:
+			}
 			if err := s.trans.Send(msg); err != nil {
 				// Carriers are reliable-ordered by contract; a send
 				// failure means the carrier is broken, and silently
