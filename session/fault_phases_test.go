@@ -159,19 +159,26 @@ func TestDisconnectDuringConfirmation(t *testing.T) {
 	errA, errB := handshakeAsync(sa, sb)
 	clientErr, exitErr := recvHandshakeErr(t, errA, errB)
 
-	// Both sides must fail with a confirmation timeout.
-	for name, err := range map[string]error{"client": clientErr, "exit": exitErr} {
-		if err == nil || !errors.Is(err, ErrHandshake) {
-			t.Fatalf("%s handshake = %v, want ErrHandshake", name, err)
-		}
-		if !strings.Contains(err.Error(), "confirmation") {
-			t.Fatalf("%s handshake = %v, want confirmation timeout", name, err)
-		}
+	// The client must fail with a confirmation timeout (it never gets
+	// the exit's encrypted PONG).
+	if clientErr == nil || !errors.Is(clientErr, ErrHandshake) {
+		t.Fatalf("client handshake = %v, want ErrHandshake", clientErr)
+	}
+	if !strings.Contains(clientErr.Error(), "confirmation") {
+		t.Fatalf("client handshake = %v, want confirmation timeout", clientErr)
+	}
+	// The exit must also fail — but the exact reason is timing-dependent:
+	// if the link dies before/while the exit's handshake starts, the
+	// failure is "transport not connected"; if the HELLO was delivered
+	// first, it is the confirmation timeout (or the carrier send error
+	// closing the session). All are correct clean failures.
+	if exitErr == nil {
+		t.Fatal("exit handshake succeeded despite severed carrier")
 	}
 	select {
 	case <-sb.Closed():
 	default:
-		t.Fatal("exit session still open after confirmation timeout")
+		t.Fatal("exit session still open after failed handshake")
 	}
 }
 
