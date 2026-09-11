@@ -19,6 +19,7 @@ import (
 	"time"
 
 	_ "github.com/wlynxg/anet"
+	"golang.org/x/term"
 
 	"github.com/leon03131/fork-openflux/exit"
 	"github.com/leon03131/fork-openflux/mux"
@@ -74,8 +75,13 @@ Flags:
 func run() error {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		// No arguments at all: interactive wizard instead of usage+FATAL.
-		return runWizard()
+		// Wizard only on a real terminal; in scripts/pipes/no-TTY show
+		// usage instead of silently waiting for stdin forever.
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			return runWizard()
+		}
+		usage()
+		return fmt.Errorf("select exactly one mode: client or exit")
 	}
 	return runArgs(args)
 }

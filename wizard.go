@@ -2,12 +2,21 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// generatePSK returns a fresh 32-byte base64 key.
+func generatePSK() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
+}
 
 // runWizard implements the interactive setup mode: `openflux` without
 // arguments asks for all required parameters step by step, shows the
@@ -175,27 +184,43 @@ func wizardArgs(in io.Reader, out io.Writer) ([]string, error) {
 		}
 	}
 
-	// 4. PSK (env first; empty answer offers --insecure).
+	// 4. PSK: env first; otherwise generate / paste / insecure.
 	fmt.Fprintln(out)
-	psk := os.Getenv("OPENFLUX_PSK")
-	if psk != "" {
+	if envPSK := os.Getenv("OPENFLUX_PSK"); envPSK != "" {
 		fmt.Fprintln(out, "PSK найден в env OPENFLUX_PSK — использую его.")
+		args = append(args, "--psk", envPSK)
 	} else {
-		s, ok := ask("PSK-ключ (сгенерировать: openssl rand -base64 32; пусто — без ключа): ")
-		if !ok {
-			return nil, nil
-		}
-		psk = s
-	}
-	if psk != "" {
-		args = append(args, "--psk", psk)
-	} else {
-		insecure, ok := askYesNo("Запустить без шифрования (--insecure)?", false)
-		if !ok {
-			return nil, nil
-		}
-		if insecure {
-			args = append(args, "--insecure")
+		fmt.Fprintln(out, "PSK-ключ (общий секрет клиента и ноды):")
+		fmt.Fprintln(out, "  [1] Сгенерировать новый (покажу — скопируешь на вторую машину)")
+		fmt.Fprintln(out, "  [2] Вставить существующий")
+		fmt.Fprintln(out, "  [3] Без шифрования (только тестирование)")
+		for {
+			choice, ok := ask("Выбор [1-3]: ")
+			if !ok {
+				return nil, nil
+			}
+			switch choice {
+			case "1":
+				psk := generatePSK()
+				fmt.Fprintf(out, "Сгенерированный PSK — скопируй его на вторую машину:\n  %s\n", psk)
+				args = append(args, "--psk", psk)
+			case "2":
+				s, ok := ask("PSK: ")
+				if !ok {
+					return nil, nil
+				}
+				if s == "" {
+					fmt.Fprintln(out, "  ! Пустой PSK.")
+					continue
+				}
+				args = append(args, "--psk", s)
+			case "3":
+				args = append(args, "--insecure")
+			default:
+				fmt.Fprintln(out, "  ! Введите 1, 2 или 3.")
+				continue
+			}
+			break
 		}
 	}
 

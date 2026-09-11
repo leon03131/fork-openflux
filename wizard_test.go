@@ -20,7 +20,7 @@ func runWizardScript(t *testing.T, script string) ([]string, string) {
 
 func TestWizardClientDirectInsecure(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
-	args, out := runWizardScript(t, "1\n1\n127.0.0.1:1\n\ny\n\n\n\n")
+	args, out := runWizardScript(t, "1\n1\n127.0.0.1:1\n3\n\n\n\n")
 	want := []string{"client", "--transport", "direct", "--addr", "127.0.0.1:1",
 		"--insecure", "--socks5", "127.0.0.1:1080"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
@@ -33,7 +33,7 @@ func TestWizardClientDirectInsecure(t *testing.T) {
 
 func TestWizardExitYandexPSK(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
-	args, out := runWizardScript(t, "2\n2\nhttps://disk.yandex.ru/i/abc\nshort\n\n\n")
+	args, out := runWizardScript(t, "2\n2\nhttps://disk.yandex.ru/i/abc\n2\nshort\n\n\n")
 	want := []string{"exit", "--transport", "onlyoffice", "--url",
 		"https://disk.yandex.ru/i/abc", "--psk", "short"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
@@ -51,7 +51,7 @@ func TestWizardExitYandexPSK(t *testing.T) {
 func TestWizardInvalidChoiceRepeats(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
 	// "abc" and "7" are invalid mode choices; the wizard must ask again.
-	args, out := runWizardScript(t, "abc\n7\n1\n1\n127.0.0.1:1\n\ny\n\n\n\n")
+	args, out := runWizardScript(t, "abc\n7\n1\n1\n127.0.0.1:1\n3\n\n\n\n")
 	if len(args) == 0 {
 		t.Fatal("wizard aborted on invalid input")
 	}
@@ -62,7 +62,7 @@ func TestWizardInvalidChoiceRepeats(t *testing.T) {
 
 func TestWizardEmptyURLRepeats(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
-	args, _ := runWizardScript(t, "2\n3\n\nhttps://cloud.mail.ru/public/abc\n\ny\n\n\n")
+	args, _ := runWizardScript(t, "2\n3\n\nhttps://cloud.mail.ru/public/abc\n3\n\n\n")
 	want := []string{"exit", "--transport", "mail", "--url",
 		"https://cloud.mail.ru/public/abc", "--insecure"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
@@ -72,7 +72,7 @@ func TestWizardEmptyURLRepeats(t *testing.T) {
 
 func TestWizardMaxUIDValidation(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
-	args, out := runWizardScript(t, "1\n4\ntok123\nnotanumber\n42\n\ny\n\n\n\n")
+	args, out := runWizardScript(t, "1\n4\ntok123\nnotanumber\n42\n3\n\n\n\n")
 	want := []string{"client", "--transport", "oneme", "--maxToken", "tok123",
 		"--maxUid", "42", "--insecure", "--socks5", "127.0.0.1:1080"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
