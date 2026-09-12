@@ -29,6 +29,7 @@ import (
 	"github.com/leon03131/fork-openflux/transport/mail"
 	"github.com/leon03131/fork-openflux/transport/oneme"
 	"github.com/leon03131/fork-openflux/transport/onlyoffice"
+	"github.com/leon03131/fork-openflux/transport/volga"
 	"github.com/leon03131/fork-openflux/transport/yandex"
 	"github.com/leon03131/fork-openflux/tunnel"
 	"github.com/leon03131/fork-openflux/utils"
@@ -101,9 +102,9 @@ func runArgs(args []string) error {
 	flag.BoolVar(&cfg.exitNode, "exit-node", false, "Run as exit node")
 	flag.BoolVar(&cfg.debug, "debug", false, "Enable verbose debug logging")
 	flag.StringVar(&cfg.socksAddr, "socks5", "127.0.0.1:1080", "SOCKS5 listen address")
-	flag.StringVar(&cfg.transportType, "transport", "yandex", "Transport type (yandex, onlyoffice, mail, oneme, direct)")
+	flag.StringVar(&cfg.transportType, "transport", "yandex", "Transport type (yandex, onlyoffice, volga, mail, oneme, direct)")
 	flag.StringVar(&cfg.mode, "mode", "v2", "Protocol mode (v2 = stream mux, legacy = gVisor packet tunnel)")
-	flag.StringVar(&cfg.docURL, "url", "", "Document URL (yandex/onlyoffice/mail transports)")
+	flag.StringVar(&cfg.docURL, "url", "", "Document URL (yandex/onlyoffice/volga/mail transports)")
 	flag.StringVar(&cfg.maxToken, "maxToken", "", "MAX Web token (oneme transport)")
 	flag.StringVar(&cfg.maxUid, "maxUid", "", "MAX call user id (oneme transport)")
 	flag.StringVar(&cfg.addr, "addr", "", "Address for direct transport (client: exit address; exit: listen address)")
@@ -196,6 +197,11 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 			return nil, fmt.Errorf("--url is required for the onlyoffice transport (Yandex Disk document URL)")
 		}
 		trans = onlyoffice.NewOnlyOfficeTransport(cfg.docURL, config)
+	case "volga":
+		if cfg.docURL == "" {
+			return nil, fmt.Errorf("--url is required for the volga transport (Yandex Disk document URL, new editor)")
+		}
+		trans = volga.NewVolgaTransport(cfg.docURL, config)
 	case "mail":
 		if cfg.docURL == "" {
 			return nil, fmt.Errorf("--url is required for the mail transport (Mail.ru Cloud public document URL)")
@@ -432,6 +438,18 @@ func runDoctor(cfg *cliConfig) error {
 		}
 		check("onlyoffice doc config fetch", nil)
 		check("onlyoffice live handshake", onlyoffice.CheckLive(cfg.docURL))
+	case "volga":
+		if cfg.docURL == "" {
+			check("--url present", flagMissing("not set"))
+			break
+		}
+		check("--url present", nil)
+		if err := volga.CheckDoc(cfg.docURL); err != nil {
+			check("volga doc authorize", err)
+			break
+		}
+		check("volga doc authorize", nil)
+		check("volga live relay+websocket", volga.CheckLive(cfg.docURL))
 	case "mail":
 		if cfg.docURL == "" {
 			check("--url present", flagMissing("not set"))
