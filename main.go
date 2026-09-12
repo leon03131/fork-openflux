@@ -333,17 +333,23 @@ func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error
 	// stays raw (TCP is already reliable).
 	rawTrans := trans
 	defer rawTrans.Stop() // runs after the adapter's Stop (LIFO)
+	var rel *reliable.Transport
 	if isDocCarrier(cfg.transportType) {
 		maxP := 64 * 1024
 		if pc, ok := trans.(interface{ MaxPayload() int }); ok && pc.MaxPayload() > 64 {
 			maxP = pc.MaxPayload() - 64
 		}
-		trans = reliable.New(ctx, trans, reliable.Config{
-			MaxUnackedFrames:   256,
-			MaxUnackedBytes:    maxP,
-			RetransmitInterval: 500 * time.Millisecond,
-		})
-		log.Printf("reliable adapter enabled (window %d KB)", maxP/1024)
+		var rcfg reliable.Config
+		rcfg.MaxUnackedFrames = 256
+		rcfg.MaxUnackedBytes = maxP
+		rcfg.RetransmitInterval = 500 * time.Millisecond
+		if len(cfg.psk) > 0 {
+			rcfg.ChannelID = reliable.DeriveChannelID([]byte(cfg.psk))
+			rcfg.MacKey = reliable.DeriveMACKey([]byte(cfg.psk))
+		}
+		rel = reliable.New(ctx, trans, rcfg)
+		trans = rel
+		log.Printf("reliable adapter enabled (window %d KB, channel %x)", maxP/1024, rcfg.ChannelID)
 	}
 	if err := trans.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
@@ -361,6 +367,11 @@ func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error
 	}
 
 	for ctx.Err() == nil {
+		// New session = new adapter generation: old unacked frames and
+		// stale epochs are dropped, never inherited.
+		if rel != nil {
+			rel.NewGeneration()
+		}
 		sess, err := session.New(trans, []byte(cfg.psk), !cfg.exitNode)
 		if err != nil {
 			return err

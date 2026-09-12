@@ -221,10 +221,13 @@ func TestReliableUnderCorruption(t *testing.T) {
 	}
 }
 
-// craftMessage builds a raw adapter wire message for injection tests.
-func craftMessage(epoch [epochSize]byte, ackThrough, seq uint64, payload []byte) []byte {
-	buf := make([]byte, 0, headerSize+frameHeader+len(payload)+crcSize)
-	buf = append(buf, "OFR1"...)
+// craftMessageV2 builds a raw OFR2 adapter wire message for injection
+// tests. macKey=nil builds a MAC-less message (matching Configs without
+// a MacKey).
+func craftMessageV2(channelID [channelIDSize]byte, macKey []byte, epoch [epochSize]byte, ackThrough, seq uint64, payload []byte) []byte {
+	buf := make([]byte, 0, headerSize+frameHeader+len(payload)+macSize+crcSize)
+	buf = append(buf, "OFR2"...)
+	buf = append(buf, channelID[:]...)
 	buf = append(buf, epoch[:]...)
 	var tmp [8]byte
 	binary.BigEndian.PutUint64(tmp[:], ackThrough)
@@ -236,16 +239,46 @@ func craftMessage(epoch [epochSize]byte, ackThrough, seq uint64, payload []byte)
 	binary.BigEndian.PutUint32(ln[:], uint32(len(payload)))
 	buf = append(buf, ln[:]...)
 	buf = append(buf, payload...)
+	if macKey != nil {
+		buf = append(buf, computeMAC(macKey, buf[magicSize:])...)
+	}
 	var cb [4]byte
 	binary.BigEndian.PutUint32(cb[:], crc32.ChecksumIEEE(buf))
 	buf = append(buf, cb[:]...)
 	return buf
 }
 
+// waitDropped polls until r's drop counter reaches want.
+func waitDropped(t *testing.T, r *Transport, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for r.Dropped() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("dropped=%d, want >= %d", r.Dropped(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitDrained polls until r's retransmit window is fully acked.
+func waitDrained(t *testing.T, r *Transport) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for r.UnackedLen() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("window did not drain: %d frames left", r.UnackedLen())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestReliableReconnect: the carrier dies mid-stream (DisconnectAfterN),
 // gets reconnected, and the link self-heals from retransmit snapshots
-// with zero loss. Afterwards a NEW adapter generation takes over the
-// same carriers and messages from the old generation are dropped.
+// with zero loss. Per the P0.1 Send contract, Send does NOT fail while
+// the carrier is down — frames buffer in the window and carrier errors
+// are swallowed (counted in TransmitErrors). Afterwards a NEW adapter
+// generation takes over the same carriers and messages from the old
+// generation are dropped.
 func TestReliableReconnect(t *testing.T) {
 	p := newPair(t)
 	p.fb.DisconnectAfterN = 50 // b's carrier dies after 50 sends
@@ -253,13 +286,13 @@ func TestReliableReconnect(t *testing.T) {
 	const total, size = 100, 256
 	cA := collect(p.ra, total)
 
-	var sendErrs atomic.Int64
 	go func() {
 		for i := 0; i < total; i++ {
+			// Never fails while the window has room: carrier errors are
+			// swallowed and healed by the retransmit ticker.
 			if err := p.rb.Send(makeMsg(i, size)); err != nil {
-				// Fail-fast error — but the frame stays queued for
-				// retransmission, so nothing is lost.
-				sendErrs.Add(1)
+				t.Errorf("send %d: %v (must buffer, not fail)", i, err)
+				return
 			}
 		}
 	}()
@@ -279,10 +312,11 @@ func TestReliableReconnect(t *testing.T) {
 	// the carrier is back; frames the peer already saw are deduped.
 	expectMessages(t, cA, 0, total, size)
 	expectNoExtra(t, cA)
-	if sendErrs.Load() == 0 {
-		t.Error("expected fail-fast Send errors while the carrier was down")
+	if n := p.rb.TransmitErrors(); n == 0 {
+		t.Error("expected swallowed carrier transmit errors during the outage")
+	} else {
+		t.Logf("swallowed carrier errors during outage: %d (all healed)", n)
 	}
-	t.Logf("send errors during outage: %d/%d (all healed)", sendErrs.Load(), total)
 
 	// --- old generation drop + handover to a new generation ---
 	oldEpoch := p.ra.epoch
@@ -314,7 +348,7 @@ func TestReliableReconnect(t *testing.T) {
 
 	// Inject a perfectly well-formed message from the OLD generation:
 	// huge ackThrough and a seq=1 frame — all of it must be ignored.
-	stale := craftMessage(oldEpoch, 1_000_000, 1, []byte("STALE-GENERATION"))
+	stale := craftMessageV2([channelIDSize]byte{}, nil, oldEpoch, 1_000_000, 1, []byte("STALE-GENERATION"))
 	dropsBefore := rb2.Dropped()
 	if err := p.fa.Send(stale); err != nil {
 		t.Fatal(err)
@@ -343,16 +377,340 @@ func TestReliableReconnect(t *testing.T) {
 	}
 }
 
+// TestNewGeneration: rotation is atomic — blocked Senders wake with
+// ErrGenerationClosed, unacked/txSeq/nextDeliver/pending reset, peer
+// epoch re-learned, previous epochs denied, and fresh traffic flows
+// once BOTH sides rotated.
+func TestNewGeneration(t *testing.T) {
+	p := newPair(t)
+	const size = 256
+
+	// Caps must absorb the 256 fill-phase deliveries: a full collector
+	// channel would park the carrier dispatch goroutine forever.
+	cB := collect(p.rb, 600)
+	cA := collect(p.ra, 600)
+	for i := 0; i < 5; i++ {
+		if err := p.ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.rb.Send(makeMsg(100+i, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectMessages(t, cB, 0, 5, size)
+	expectMessages(t, cA, 100, 105, size)
+	waitDrained(t, p.ra)
+	waitDrained(t, p.rb)
+
+	oldEpochA := p.ra.epoch
+	oldEpochB := p.rb.epoch
+
+	// Fill A's window with the ack path down and park a blocked Sender.
+	p.fb.DropProb = 1.0
+	payload := makeMsg(0, 512)
+	for i := 0; i < DefaultMaxUnackedFrames; i++ {
+		if err := p.ra.Send(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := make(chan error, 1)
+	go func() { blocked <- p.ra.Send(payload) }()
+	select {
+	case err := <-blocked:
+		t.Fatalf("Send returned %v with a full window; must block", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := p.ra.NewGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, ErrGenerationClosed) {
+			t.Fatalf("blocked Send: %v, want ErrGenerationClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked Send not woken by NewGeneration")
+	}
+	if n := p.ra.UnackedLen(); n != 0 {
+		t.Fatalf("unacked=%d after NewGeneration, want 0", n)
+	}
+	if b := p.ra.UnackedBytes(); b != 0 {
+		t.Fatalf("unackedBytes=%d after NewGeneration, want 0", b)
+	}
+	p.ra.mu.Lock()
+	if p.ra.txSeq != 1 || p.ra.nextDeliver != 1 || len(p.ra.pending) != 0 || p.ra.peerEpochSet {
+		t.Fatalf("state not reset: txSeq=%d nextDeliver=%d pending=%d peerEpochSet=%v",
+			p.ra.txSeq, p.ra.nextDeliver, len(p.ra.pending), p.ra.peerEpochSet)
+	}
+	newEpochA := p.ra.epoch
+	denyA := append([][epochSize]byte(nil), p.ra.denyEpochs...)
+	p.ra.mu.Unlock()
+	if newEpochA == oldEpochA {
+		t.Fatal("epoch not rotated")
+	}
+	if len(denyA) != 2 || denyA[0] != oldEpochA || denyA[1] != oldEpochB {
+		t.Fatalf("deny list = %v, want [%x %x]", denyA, oldEpochA[:4], oldEpochB[:4])
+	}
+
+	// Heal b->a (with B still on the old generation nothing flows
+	// spontaneously: both windows are empty and the tickers stay silent),
+	// then inject a well-formed old-epoch-B message: it must NOT re-latch
+	// as the new peer generation — the epoch is on A's deny list. The
+	// sleep lets any ack signal pending from the fill phase fire and
+	// settle first, so the drop baseline below is exact.
+	p.fb.DropProb = 0
+	time.Sleep(100 * time.Millisecond)
+	drops := p.ra.Dropped()
+	if err := p.fb.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochB, 999, 1, []byte("STALE-B"))); err != nil {
+		t.Fatal(err)
+	}
+	waitDropped(t, p.ra, drops+1)
+	p.ra.mu.Lock()
+	stillFresh := !p.ra.peerEpochSet
+	p.ra.mu.Unlock()
+	if !stillFresh {
+		t.Fatal("denied epoch re-latched as the new peer generation")
+	}
+
+	// Rotate B too, and fresh traffic must flow cleanly with sequences
+	// restarted from 1 on both sides.
+	if err := p.rb.NewGeneration(); err != nil {
+		t.Fatal(err)
+	}
+
+	cB2 := collect(p.rb, 32)
+	cA2 := collect(p.ra, 32)
+	for i := 0; i < 10; i++ {
+		if err := p.ra.Send(makeMsg(9000+i, size)); err != nil {
+			t.Fatalf("fresh a->b %d: %v", i, err)
+		}
+	}
+	expectMessages(t, cB2, 9000, 9010, size)
+	for i := 0; i < 10; i++ {
+		if err := p.rb.Send(makeMsg(9100+i, size)); err != nil {
+			t.Fatalf("fresh b->a %d: %v", i, err)
+		}
+	}
+	expectMessages(t, cA2, 9100, 9110, size)
+	expectNoExtra(t, cB2)
+	expectNoExtra(t, cA2)
+
+	// Old-generation injections are still dropped after the re-latch.
+	drops = p.rb.Dropped()
+	if err := p.fa.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochA, 999999, 1, []byte("STALE-A"))); err != nil {
+		t.Fatal(err)
+	}
+	waitDropped(t, p.rb, drops+1)
+
+	// NewGeneration on a stopped adapter fails honestly.
+	if err := p.ra.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ra.NewGeneration(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("NewGeneration after Stop: %v, want ErrClosed", err)
+	}
+}
+
+// TestChannelIsolation: two pairs with different ChannelIDs on a shared
+// carrier must not cross-latch — a foreign-channel snapshot is dropped
+// BEFORE any other processing, even when its epoch and seq would
+// otherwise be accepted (and delivered).
+func TestChannelIsolation(t *testing.T) {
+	p := newPair(t) // default config: ChannelID all-zero
+	const size = 256
+	cB := collect(p.rb, 16)
+	for i := 0; i < 5; i++ {
+		if err := p.ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectMessages(t, cB, 0, 5, size)
+
+	// A forged snapshot from a DIFFERENT channel carrying rb's latched
+	// peer epoch and the exact next expected seq: without channel
+	// isolation this would be accepted and delivered (poison).
+	p.rb.mu.Lock()
+	nd, peerEp := p.rb.nextDeliver, p.rb.peerEpoch
+	p.rb.mu.Unlock()
+	foreignCh := [channelIDSize]byte{0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4}
+	poison := craftMessageV2(foreignCh, nil, peerEp, 0, nd, []byte("POISON-PAYLOAD"))
+	drops := p.rb.Dropped()
+	if err := p.fa.Send(poison); err != nil {
+		t.Fatal(err)
+	}
+	waitDropped(t, p.rb, drops+1)
+
+	// The legit next message is still delivered as #5, poison never was.
+	if err := p.ra.Send(makeMsg(5, size)); err != nil {
+		t.Fatal(err)
+	}
+	expectMessages(t, cB, 5, 6, size)
+	expectNoExtra(t, cB)
+}
+
+// TestMACProtection: with a MacKey configured, forged/tampered snapshots
+// are dropped silently before their content is ever looked at, while
+// authentic traffic flows untouched.
+func TestMACProtection(t *testing.T) {
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	cfg := testConfig()
+	cfg.MacKey = DeriveMACKey(psk)
+	cfg.ChannelID = DeriveChannelID(psk)
+
+	fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+	if err := fa.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer fa.Stop()
+	defer fb.Stop()
+	ra := New(context.Background(), fa, cfg)
+	rb := New(context.Background(), fb, cfg)
+	if err := ra.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer ra.Stop()
+	defer rb.Stop()
+
+	const size = 128
+	c := collect(rb, 16)
+	for i := 0; i < 5; i++ {
+		if err := ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectMessages(t, c, 0, 5, size)
+
+	drops := rb.Dropped()
+	// (a) Right channel, MAC computed with the WRONG key: CRC is valid,
+	//     MAC is not — silent drop before content inspection.
+	wrongKey := DeriveMACKey([]byte("attacker-psk"))
+	if err := fa.Send(craftMessageV2(cfg.ChannelID, wrongKey[:], [epochSize]byte{1}, 0, 1, []byte("forged"))); err != nil {
+		t.Fatal(err)
+	}
+	// (b) Right channel and key, but a MAC byte flipped (CRC re-fixed):
+	//     proves the MAC is really verified, not just the CRC.
+	tampered := craftMessageV2(cfg.ChannelID, cfg.MacKey[:], [epochSize]byte{2}, 0, 1, []byte("x"))
+	macStart := len(tampered) - crcSize - macSize
+	tampered[macStart] ^= 0xFF
+	binary.BigEndian.PutUint32(tampered[len(tampered)-crcSize:], crc32.ChecksumIEEE(tampered[:len(tampered)-crcSize]))
+	if err := fa.Send(tampered); err != nil {
+		t.Fatal(err)
+	}
+	// (c) MAC-less message on a MAC-enabled link: too short / fails MAC.
+	if err := fa.Send(craftMessageV2(cfg.ChannelID, nil, [epochSize]byte{3}, 0, 1, []byte("no-mac"))); err != nil {
+		t.Fatal(err)
+	}
+	waitDropped(t, rb, drops+3)
+
+	// The link is unaffected afterwards.
+	for i := 5; i < 10; i++ {
+		if err := ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expectMessages(t, c, 5, 10, size)
+	expectNoExtra(t, c)
+}
+
+// TestSnapshotFitsCarrierBudget: the P0.4 invariant — ANY snapshot is
+// always <= inner.MaxPayload(), no matter how the window is filled, and
+// a single MaxPayload-sized message fits exactly.
+func TestSnapshotFitsCarrierBudget(t *testing.T) {
+	const innerMax = 256 * 1024 // FaultyTransport.MaxPayload
+
+	p := newPair(t)
+	p.fb.DropProb = 1.0 // pin everything in the window
+
+	// Fill with a realistic size mix until the window refuses more.
+	sizes := []int{100, 1000, 5000, 20000}
+	sent := 0
+loop:
+	for sent < DefaultMaxUnackedFrames {
+		sz := sizes[sent%len(sizes)]
+		done := make(chan error, 1)
+		go func() { done <- p.ra.Send(makeMsg(sent, sz)) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("send %d: %v", sent, err)
+			}
+			sent++
+		case <-time.After(300 * time.Millisecond):
+			break loop
+		}
+	}
+	if sent == 0 {
+		t.Fatal("nothing fit in the window")
+	}
+	p.ra.mu.Lock()
+	snap := p.ra.buildSnapshotLocked()
+	want := headerSize + p.ra.unackedBytes + crcSize // no MAC configured
+	p.ra.mu.Unlock()
+	if len(snap) != want {
+		t.Fatalf("snapshot len=%d, want exactly header+window+crc=%d", len(snap), want)
+	}
+	if len(snap) > innerMax {
+		t.Fatalf("snapshot %d B exceeds inner budget %d B", len(snap), innerMax)
+	}
+	t.Logf("full window: %d frames, snapshot %d/%d B", sent, len(snap), innerMax)
+
+	// Single MaxPayload-sized message fits exactly (MAC off and on).
+	for _, withMAC := range []bool{false, true} {
+		cfg := testConfig()
+		if withMAC {
+			cfg.MacKey = DeriveMACKey([]byte("budget-psk"))
+		}
+		r := New(context.Background(), p.fa, cfg)
+		r.mu.Lock()
+		r.unacked = []outFrame{{seq: 1, payload: make([]byte, r.MaxPayload())}}
+		r.unackedBytes = frameHeader + r.MaxPayload()
+		s := r.buildSnapshotLocked()
+		r.mu.Unlock()
+		if len(s) > innerMax {
+			t.Fatalf("withMAC=%v: max-payload snapshot %d B > inner %d B", withMAC, len(s), innerMax)
+		}
+		if withMAC && len(s) != innerMax {
+			t.Fatalf("max-payload snapshot with MAC: %d B, want exactly %d B", len(s), innerMax)
+		}
+	}
+
+	// And a MaxPayload message round-trips end to end.
+	p.fb.DropProb = 0
+	waitDrained(t, p.ra)
+	c := collect(p.rb, 1)
+	big := makeMsg(777, p.ra.MaxPayload())
+	if err := p.ra.Send(big); err != nil {
+		t.Fatalf("MaxPayload send: %v", err)
+	}
+	select {
+	case got := <-c.ch:
+		checkMsg(t, got, 777, p.ra.MaxPayload())
+	case <-time.After(15 * time.Second):
+		t.Fatal("MaxPayload message not delivered")
+	}
+}
+
 // TestReliableBackpressure: with the ack path fully down the window
 // fills, Send blocks without growing memory, and unblocks on ack
-// progress. Also: byte bound, ctx cancel and Stop as unblock paths.
+// progress. Also: byte bound, send timeout, dead carrier, ctx cancel
+// and Stop as unblock paths.
 func TestReliableBackpressure(t *testing.T) {
 	t.Run("FrameBoundBlocksAndHeals", func(t *testing.T) {
 		p := newPair(t)
 		p.fb.DropProb = 1.0 // no ack ever reaches a
 
 		const window = DefaultMaxUnackedFrames
-		payload := makeMsg(0, 1024)
+		// 512 B payloads: 256*(512+12) = 134,144 wire bytes, well under
+		// the snapshot-fit byte budget, so the FRAME bound is what trips.
+		const size = 512
+		payload := makeMsg(0, size)
 		for i := 0; i < window; i++ {
 			if err := p.ra.Send(payload); err != nil {
 				t.Fatalf("fill send %d: %v", i, err)
@@ -373,8 +731,8 @@ func TestReliableBackpressure(t *testing.T) {
 		if n := p.ra.UnackedLen(); n != window {
 			t.Fatalf("window grew while blocked: %d", n)
 		}
-		if b := p.ra.UnackedBytes(); b != window*1024 {
-			t.Fatalf("unackedBytes=%d, want %d", b, window*1024)
+		if b, want := p.ra.UnackedBytes(), window*(size+frameHeader); b != want {
+			t.Fatalf("unackedBytes=%d, want %d (wire accounting)", b, want)
 		}
 
 		p.fb.DropProb = 0 // heal the ack path
@@ -387,20 +745,23 @@ func TestReliableBackpressure(t *testing.T) {
 			t.Fatal("blocked Send did not wake on ack progress")
 		}
 		// The window drains fully once acks flow.
-		deadline := time.Now().Add(15 * time.Second)
-		for p.ra.UnackedLen() > 0 {
-			if time.Now().After(deadline) {
-				t.Fatalf("window did not drain: %d frames left", p.ra.UnackedLen())
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		waitDrained(t, p.ra)
 	})
 
 	t.Run("ByteBound", func(t *testing.T) {
 		p := newPair(t)
 		p.fb.DropProb = 1.0
 
-		big := makeMsg(0, 100*1024)
+		// Wire accounting: each frame costs frameHeader+payload, and the
+		// byte budget is min(MaxUnackedBytes, what fits one snapshot on
+		// the 256 KiB faulty carrier) = 262144 - (38+16+4) = 262,086.
+		const payloadSize = 100 * 1024
+		budget := 256*1024 - (headerSize + macSize + crcSize)
+		if DefaultMaxUnackedBytes < budget {
+			budget = DefaultMaxUnackedBytes
+		}
+		want := budget / (frameHeader + payloadSize) // 2
+		big := makeMsg(0, payloadSize)
 		sent := 0
 		for sent < DefaultMaxUnackedFrames { // frame bound must NOT trigger first
 			done := make(chan error, 1)
@@ -416,12 +777,78 @@ func TestReliableBackpressure(t *testing.T) {
 			}
 		}
 	full:
-		// 20 x 100 KiB = 2,048,000 <= 2 MiB; the 21st would overflow.
-		if sent != 20 {
-			t.Fatalf("byte bound: %d payloads fit, want 20", sent)
+		if sent != want {
+			t.Fatalf("byte bound: %d payloads fit, want %d", sent, want)
 		}
-		if b := p.ra.UnackedBytes(); b > DefaultMaxUnackedBytes {
-			t.Fatalf("unackedBytes=%d exceeds bound %d", b, DefaultMaxUnackedBytes)
+		if b := p.ra.UnackedBytes(); b > budget {
+			t.Fatalf("unackedBytes=%d exceeds budget %d", b, budget)
+		}
+	})
+
+	t.Run("SendTimeout", func(t *testing.T) {
+		fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+		if err := fa.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := fb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer fa.Stop()
+		defer fb.Stop()
+
+		cfg := testConfig()
+		cfg.SendTimeout = 200 * time.Millisecond
+		ra := New(context.Background(), fa, cfg)
+		rb := New(context.Background(), fb, cfg)
+		if err := ra.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer ra.Stop()
+		defer rb.Stop()
+		fb.DropProb = 1.0 // no ack ever reaches ra
+
+		payload := makeMsg(0, 512)
+		for i := 0; i < DefaultMaxUnackedFrames; i++ {
+			if err := ra.Send(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		start := time.Now()
+		err := ra.Send(payload)
+		if !errors.Is(err, ErrBackpressure) {
+			t.Fatalf("Send with full window: %v, want ErrBackpressure", err)
+		}
+		if d := time.Since(start); d < 150*time.Millisecond || d > 10*time.Second {
+			t.Fatalf("Send unblocked after %v, want ~200ms (SendTimeout)", d)
+		}
+	})
+
+	t.Run("CarrierStoppedFails", func(t *testing.T) {
+		fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+		if err := fa.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := fb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer fb.Stop()
+		ra := New(context.Background(), fa, Config{})
+		rb := New(context.Background(), fb, Config{})
+		if err := ra.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer ra.Stop()
+		defer rb.Stop()
+
+		fa.Stop() // the carrier is finally dead (not a reconnect)
+		if err := ra.Send(makeMsg(0, 64)); !errors.Is(err, ErrCarrierDown) {
+			t.Fatalf("Send over stopped carrier: %v, want ErrCarrierDown", err)
 		}
 	})
 
@@ -430,7 +857,7 @@ func TestReliableBackpressure(t *testing.T) {
 		p := newPairCtx(t, ctx)
 		p.fb.DropProb = 1.0
 
-		payload := makeMsg(0, 1024)
+		payload := makeMsg(0, 512)
 		for i := 0; i < DefaultMaxUnackedFrames; i++ {
 			if err := p.ra.Send(payload); err != nil {
 				t.Fatal(err)
@@ -454,7 +881,7 @@ func TestReliableBackpressure(t *testing.T) {
 		p := newPair(t)
 		p.fb.DropProb = 1.0
 
-		payload := makeMsg(0, 1024)
+		payload := makeMsg(0, 512)
 		for i := 0; i < DefaultMaxUnackedFrames; i++ {
 			if err := p.ra.Send(payload); err != nil {
 				t.Fatal(err)
@@ -508,6 +935,16 @@ func TestLifecycleGuards(t *testing.T) {
 	if err := r.Send(make([]byte, r.MaxPayload()+1)); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("oversized Send: %v, want ErrTooLarge", err)
 	}
+	// P0.1 watchdog contract: a transient inner disconnect must NOT kill
+	// the adapter's IsConnected — the session survives carrier reconnects.
+	if !r.IsConnected() {
+		t.Error("IsConnected=false on a started adapter")
+	}
+	fa.SetConnected(false)
+	if !r.IsConnected() {
+		t.Error("IsConnected must ignore transient inner disconnect")
+	}
+	fa.SetConnected(true)
 	if err := r.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -534,7 +971,7 @@ func TestBuildParseRoundtrip(t *testing.T) {
 	snap := r.buildSnapshotLocked()
 	r.mu.Unlock()
 
-	m, ok := parseMessage(snap)
+	m, ok := r.parseMessage(snap)
 	if !ok {
 		t.Fatal("parseMessage rejected our own snapshot")
 	}
@@ -561,7 +998,7 @@ func TestBuildParseRoundtrip(t *testing.T) {
 	r.unacked = nil
 	snap = r.buildSnapshotLocked()
 	r.mu.Unlock()
-	m, ok = parseMessage(snap)
+	m, ok = r.parseMessage(snap)
 	if !ok || len(m.frames) != 0 {
 		t.Fatalf("empty snapshot: ok=%v frames=%d", ok, len(m.frames))
 	}
@@ -572,11 +1009,12 @@ func FuzzParseMessage(f *testing.F) {
 	r := New(context.Background(), nil, Config{})
 	r.mu.Lock()
 	r.unacked = []outFrame{{seq: 1, payload: []byte("seed")}, {seq: 2, payload: nil}}
+	r.unackedBytes = 2*frameHeader + 4
 	valid := r.buildSnapshotLocked()
 	r.mu.Unlock()
 	f.Add(valid)
 	f.Add([]byte(""))
-	f.Add([]byte("OFR1"))
+	f.Add([]byte("OFR2"))
 	f.Add(valid[:len(valid)-2])          // truncated
 	f.Add(append([]byte("X"), valid...)) // prefixed garbage
 	mut := append([]byte(nil), valid...)
@@ -584,11 +1022,43 @@ func FuzzParseMessage(f *testing.F) {
 	f.Add(mut)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		m, ok := parseMessage(data) // must not panic
+		m, ok := r.parseMessage(data) // must not panic
 		if !ok {
 			return
 		}
 		// If it parsed, the frames must fit inside the input.
+		total := 0
+		for _, fr := range m.frames {
+			total += len(fr.payload)
+		}
+		if total > len(data) {
+			t.Fatalf("frames carry %d bytes from a %d-byte input", total, len(data))
+		}
+	})
+}
+
+// FuzzParseMessageMAC: same, with metadata authentication enabled.
+func FuzzParseMessageMAC(f *testing.F) {
+	cfg := Config{}
+	cfg.MacKey = DeriveMACKey([]byte("fuzz-psk"))
+	cfg.ChannelID = DeriveChannelID([]byte("fuzz-psk"))
+	r := New(context.Background(), nil, cfg)
+	r.mu.Lock()
+	r.unacked = []outFrame{{seq: 1, payload: []byte("seed")}, {seq: 2, payload: nil}}
+	r.unackedBytes = 2*frameHeader + 4
+	valid := r.buildSnapshotLocked()
+	r.mu.Unlock()
+	f.Add(valid)
+	f.Add(valid[:len(valid)-2])
+	mut := append([]byte(nil), valid...)
+	mut[len(mut)/2] ^= 0xFF
+	f.Add(mut)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		m, ok := r.parseMessage(data) // must not panic
+		if !ok {
+			return
+		}
 		total := 0
 		for _, fr := range m.frames {
 			total += len(fr.payload)
