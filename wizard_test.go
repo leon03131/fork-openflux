@@ -34,7 +34,7 @@ func TestWizardClientDirectInsecure(t *testing.T) {
 func TestWizardExitYandexPSK(t *testing.T) {
 	t.Setenv("OPENFLUX_PSK", "")
 	args, out := runWizardScript(t, "2\n2\nhttps://disk.yandex.ru/i/abc\n2\nshort\n\n\n")
-	want := []string{"exit", "--transport", "onlyoffice", "--url",
+	want := []string{"exit", "--transport", "yandex", "--url",
 		"https://disk.yandex.ru/i/abc", "--psk", "short"}
 	if strings.Join(args, " ") != strings.Join(want, " ") {
 		t.Fatalf("args = %v, want %v", args, want)
