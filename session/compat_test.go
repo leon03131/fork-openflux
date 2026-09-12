@@ -120,13 +120,9 @@ func TestLegacyClientNewServer(t *testing.T) {
 	defer server.Close()
 	go server.Handshake() // server waits for HELLO + confirmation
 
-	priv, _ := generateEphemeralKey()
-	payload := append([]byte{1}, priv.PublicKey().Bytes()...)
-	buf, _ := wire.Encode(nil, wire.Frame{Type: wire.TypeHello, Payload: payload})
-	if err := ta.Send(buf); err != nil {
-		t.Fatal(err)
-	}
-
+	// Register the ACK listener BEFORE sending HELLO: under -race the
+	// server's answer can otherwise arrive before registration and be
+	// dropped silently.
 	ackCh := make(chan wire.Frame, 1)
 	ta.Receive(func(msg []byte) {
 		f, err := wire.Decode(msg)
@@ -134,6 +130,13 @@ func TestLegacyClientNewServer(t *testing.T) {
 			ackCh <- f
 		}
 	})
+
+	priv, _ := generateEphemeralKey()
+	payload := append([]byte{1}, priv.PublicKey().Bytes()...)
+	buf, _ := wire.Encode(nil, wire.Frame{Type: wire.TypeHello, Payload: payload})
+	if err := ta.Send(buf); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case f := <-ackCh:
