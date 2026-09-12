@@ -368,10 +368,15 @@ func (t *Transport) NewGeneration() error {
 		return ErrClosed
 	}
 
-	deny := make([][epochSize]byte, 0, 2)
-	deny = append(deny, t.epoch)
+	// Bounded deny history (16 recent epochs): protects against
+	// re-latching a stale peer epoch even after several unilateral
+	// rotations in a row.
+	deny := append(t.denyEpochs, t.epoch)
 	if t.peerEpochSet {
 		deny = append(deny, t.peerEpoch)
+	}
+	if len(deny) > 16 {
+		deny = deny[len(deny)-16:]
 	}
 	t.denyEpochs = deny
 

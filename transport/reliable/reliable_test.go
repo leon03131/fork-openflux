@@ -619,6 +619,118 @@ func TestMACProtection(t *testing.T) {
 	expectNoExtra(t, c)
 }
 
+// strictCap wraps a FaultyTransport with a hard 64 KiB budget and
+// rejects oversize Sends (production-like carrier).
+type strictCap struct {
+	*transport.FaultyTransport
+}
+
+func (s *strictCap) MaxPayload() int { return 65536 }
+
+func (s *strictCap) Send(data []byte) error {
+	if len(data) > 65536 {
+		return errors.New("oversize")
+	}
+	return s.FaultyTransport.Send(data)
+}
+
+// TestProductionConfigMaxPayload regression: with a strict 64 KiB inner
+// carrier and MAC enabled (production), Send(MaxPayload()) MUST succeed
+// and every snapshot on the wire MUST be <= inner.MaxPayload().
+func TestProductionConfigMaxPayload(t *testing.T) {
+	fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+	fa.Start()
+	fb.Start()
+	t.Cleanup(func() { fa.Stop(); fb.Stop() })
+
+	psk := []byte("0123456789abcdef0123456789abcdef")
+	cfg := testConfig()
+	cfg.ChannelID = DeriveChannelID(psk)
+	cfg.MacKey = DeriveMACKey(psk)
+
+	sa, sb := &strictCap{fa}, &strictCap{fb}
+	ra := New(context.Background(), sa, cfg)
+	rb := New(context.Background(), sb, cfg)
+	if err := ra.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer ra.Stop()
+	defer rb.Stop()
+
+	// MaxPayload must be accepted: ErrTooLarge here = the off-by-N bug.
+	maxMsg := makeMsg(1, ra.MaxPayload())
+	if err := ra.Send(maxMsg); err != nil {
+		t.Fatalf("Send(MaxPayload=%d): %v", ra.MaxPayload(), err)
+	}
+
+	// Receive it back to prove the full path works at the boundary.
+	got := make(chan []byte, 1)
+	rb.Receive(func(d []byte) { got <- d })
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("MaxPayload message never delivered")
+	}
+}
+
+// TestDoubleRotationDenyHistory: A rotates twice without B; an old B
+// epoch must NOT re-latch onto A; after B rotates, fresh traffic works.
+func TestDoubleRotationDenyHistory(t *testing.T) {
+	p := newPair(t)
+
+	// Establish: exchange one message so peerEpoch is latched on both.
+	cB := collect(p.rb, 64)
+	if err := p.ra.Send([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-cB.ch:
+		if string(got) != "hello" {
+			t.Fatalf("got %q, want hello", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hello never delivered")
+	}
+
+	p.rb.mu.Lock()
+	epochB0 := p.rb.epoch
+	p.rb.mu.Unlock()
+
+	// A rotates twice without B.
+	p.ra.NewGeneration()
+	p.ra.NewGeneration()
+
+	// Inject a frame from B's OLD epoch into A: must be dropped (deny
+	// history covers it), and A must not latch it as a new peer.
+	stale := craftMessageV2([channelIDSize]byte{}, nil, epochB0, 0, 1, []byte("stale"))
+	p.fa.Send(stale) // fa delivers to A
+
+	p.ra.mu.Lock()
+	latched := p.ra.peerEpochSet && p.ra.peerEpoch == epochB0
+	p.ra.mu.Unlock()
+	if latched {
+		t.Fatal("A latched onto a stale B epoch after double rotation")
+	}
+
+	// B rotates too; fresh traffic must flow on the new generations.
+	p.rb.NewGeneration()
+	cB2 := collect(p.rb, 64)
+	if err := p.ra.Send([]byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-cB2.ch:
+		if string(got) != "fresh" {
+			t.Fatalf("got %q, want fresh", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fresh traffic did not flow after both rotated")
+	}
+}
+
 // TestSnapshotFitsCarrierBudget: the P0.4 invariant — ANY snapshot is
 // always <= inner.MaxPayload(), no matter how the window is filled, and
 // a single MaxPayload-sized message fits exactly.

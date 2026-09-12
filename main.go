@@ -244,15 +244,16 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 	return trans, nil
 }
 
-// validatePSK enforces PSK strength: only real 32-byte random keys in
-// base64 or hex are accepted (Noise requires 256 bits of PSK entropy;
-// human passphrases are not allowed as they are offline-bruteforceable).
+// validatePSK enforces PSK strength and canonicalizes the key: only real
+// 32-byte random keys in base64 or hex are accepted, and the canonical
+// base64 form is returned, so the SAME key in either encoding yields the
+// same session/channel/MAC keys on both sides.
 func validatePSK(psk string) (string, error) {
 	if b, err := hex.DecodeString(psk); err == nil && len(b) == 32 {
-		return psk, nil // 32-byte hex key
+		return base64.StdEncoding.EncodeToString(b), nil
 	}
 	if b, err := base64.StdEncoding.DecodeString(psk); err == nil && len(b) == 32 {
-		return psk, nil // 32-byte base64 key
+		return base64.StdEncoding.EncodeToString(b), nil
 	}
 	return "", fmt.Errorf("PSK must be a 32-byte random key in base64 or hex; generate one with `openssl rand -base64 32`")
 }
@@ -335,21 +336,16 @@ func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error
 	defer rawTrans.Stop() // runs after the adapter's Stop (LIFO)
 	var rel *reliable.Transport
 	if isDocCarrier(cfg.transportType) {
-		maxP := 64 * 1024
-		if pc, ok := trans.(interface{ MaxPayload() int }); ok && pc.MaxPayload() > 64 {
-			maxP = pc.MaxPayload() - 64
-		}
-		var rcfg reliable.Config
-		rcfg.MaxUnackedFrames = 256
-		rcfg.MaxUnackedBytes = maxP
-		rcfg.RetransmitInterval = 500 * time.Millisecond
-		if len(cfg.psk) > 0 {
-			rcfg.ChannelID = reliable.DeriveChannelID([]byte(cfg.psk))
-			rcfg.MacKey = reliable.DeriveMACKey([]byte(cfg.psk))
+		// Do NOT duplicate OFR framing arithmetic here: the memory/window
+		// cap uses defaults; snapshot-fit against the carrier budget is
+		// centralized inside reliable (windowByteBudget).
+		rcfg := reliable.Config{
+			ChannelID:  reliable.DeriveChannelID([]byte(cfg.psk)),
+			MacKey:     reliable.DeriveMACKey([]byte(cfg.psk)),
 		}
 		rel = reliable.New(ctx, trans, rcfg)
 		trans = rel
-		log.Printf("reliable adapter enabled (window %d KB, channel %x)", maxP/1024, rcfg.ChannelID)
+		log.Printf("reliable adapter enabled (channel %x)", rcfg.ChannelID)
 	}
 	if err := trans.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
