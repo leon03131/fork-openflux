@@ -149,17 +149,23 @@ func supervise(ctx context.Context, t *testing.T, ta, tb *transport.FaultyTransp
 		go func() { hs <- sa.Handshake() }()
 		go func() { hs <- sb.Handshake() }()
 		var herr error
+		received := 0
 		for i := 0; i < 2; i++ {
 			select {
 			case e := <-hs:
+				received++
 				if e != nil && herr == nil {
 					herr = e
 				}
 			case <-ctx.Done():
 				sa.CloseWithError(errTeardown)
 				sb.CloseWithError(errTeardown)
-				<-hs
-				<-hs
+				// Drain only the results not yet consumed, otherwise
+				// this blocks forever on the second read.
+				for received < 2 {
+					<-hs
+					received++
+				}
 				return
 			}
 		}

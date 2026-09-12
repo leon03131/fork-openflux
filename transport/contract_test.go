@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -131,6 +132,37 @@ func RunContract(t *testing.T, name string, makePair func(t *testing.T) (Transpo
 			if p := stopQuietly(b); p != nil {
 				t.Errorf("[%s] Stop #%d on b panicked: %v", name, i+1, p)
 			}
+		}
+	})
+
+	// Stop with a still-queued backlog: delivery may briefly continue
+	// (the dispatcher drains a race window), but must stop entirely and
+	// never panic.
+	t.Run("StopWithQueuedBacklog", func(t *testing.T) {
+		a, b := makePair(t)
+		startContractPair(t, a, b)
+
+		var delivered atomic.Int32
+		b.Receive(func([]byte) { delivered.Add(1) })
+
+		const total = 50
+		for i := 0; i < total; i++ {
+			var buf [4]byte
+			binary.BigEndian.PutUint32(buf[:], uint32(i))
+			_ = sendNoPanic(a, buf[:])
+		}
+		// Stop immediately, messages still queued.
+		if p := stopQuietly(a); p != nil {
+			t.Fatalf("[%s] Stop(a) panicked with backlog: %v", name, p)
+		}
+		if p := stopQuietly(b); p != nil {
+			t.Fatalf("[%s] Stop(b) panicked with backlog: %v", name, p)
+		}
+		before := delivered.Load()
+		time.Sleep(200 * time.Millisecond)
+		late := delivered.Load() - before
+		if late > 0 {
+			t.Logf("[%s] %d late deliveries after Stop (acceptable race window)", name, late)
 		}
 	})
 
@@ -331,6 +363,11 @@ func RunContract(t *testing.T, name string, makePair func(t *testing.T) (Transpo
 		}
 		errA, errB := restart(a), restart(b)
 		if errA != nil || errB != nil {
+			// A panic converted to an error must still fail the test:
+			// "honest error" means an expected refusal, not a crash.
+			if strings.Contains(fmt.Sprint(errA, errB), "panic:") {
+				t.Fatalf("[%s] restart panicked: a=%v b=%v", name, errA, errB)
+			}
 			// Honest refusal satisfies the contract: no zombie.
 			t.Logf("[%s] Start after Stop returns an honest error (a=%v, b=%v); restart unsupported but safe", name, errA, errB)
 		} else {

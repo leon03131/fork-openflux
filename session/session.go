@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -411,10 +412,18 @@ func (s *Session) dispatch(f wire.Frame) {
 				s.failHello(err)
 				return
 			}
+			// Capabilities are part of the confirmed transcript.
+			caps := s.peerCaps.Load()
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
-			tag := c.computeKeyConfirm(clientPub, serverPub)
-			// [role][pubkey][caps][tag]
-			ackPayload := append(append(append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...), ourCapabilities), tag...)
+			tag := c.computeKeyConfirm(clientPub, serverPub, byte(caps), ourCapabilities)
+			// Answer in the peer's format: a legacy HELLO (33 bytes, no
+			// caps) gets a legacy ACK (124 bytes), so partial compat
+			// actually works in both directions.
+			ackPayload := append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...)
+			if len(f.Payload) == 34 {
+				ackPayload = append(ackPayload, ourCapabilities)
+			}
+			ackPayload = append(ackPayload, tag...)
 			// HELLO_ACK must leave in plaintext: the client derives keys
 			// from it. Enqueued before crypto is enabled, and the writer
 			// preserves order.
@@ -460,7 +469,7 @@ func (s *Session) dispatch(f wire.Frame) {
 				return
 			}
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
-			if !c.verifyKeyConfirm(clientPub, serverPub, f.Payload[tagOffset:]) {
+			if !c.verifyKeyConfirm(clientPub, serverPub, ourCapabilities, byte(s.peerCaps.Load()), f.Payload[tagOffset:]) {
 				s.failHello(errors.New("key confirmation failed (PSK mismatch?)"))
 				return
 			}
@@ -497,6 +506,12 @@ func (s *Session) OnFrame(cb func(wire.Frame)) {
 }
 
 func (s *Session) SendFrame(f wire.Frame) error {
+	return s.SendFrameDeadline(f, time.Time{})
+}
+
+// SendFrameDeadline is SendFrame with an optional deadline on the queue
+// wait (zero = block until queued or closed).
+func (s *Session) SendFrameDeadline(f wire.Frame, deadline time.Time) error {
 	select {
 	case <-s.closed:
 		return ErrClosed
@@ -522,6 +537,10 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	}
 	// Enqueue for the writer goroutine. Blocks (applying backpressure)
 	// when the carrier is saturated; unblocks with ErrClosed on Close.
+	var timeout <-chan time.Time
+	if !deadline.IsZero() {
+		timeout = time.After(time.Until(deadline))
+	}
 	select {
 	case s.sendQueue <- buf:
 		s.sendMu.Unlock()
@@ -529,6 +548,9 @@ func (s *Session) SendFrame(f wire.Frame) error {
 	case <-s.closed:
 		s.sendMu.Unlock()
 		return ErrClosed
+	case <-timeout:
+		s.sendMu.Unlock()
+		return os.ErrDeadlineExceeded
 	}
 }
 

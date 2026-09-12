@@ -39,8 +39,9 @@ const (
 	// transmitted.
 	aeadOverhead = 8 + chacha20poly1305.Overhead
 
-	// keyConfirmTagLen = len("OPENFLUX-KC") + 64 pub bytes + AEAD tag.
-	keyConfirmTagLen = 11 + 64 + chacha20poly1305.Overhead
+	// keyConfirmTagLen = len("OPENFLUX-KC") + 64 pub bytes + 2 caps
+	// bytes + AEAD tag.
+	keyConfirmTagLen = 11 + 64 + 2 + chacha20poly1305.Overhead
 )
 
 // ErrCryptoMismatch indicates the peer failed to decrypt repeatedly —
@@ -214,25 +215,26 @@ func (c *sessionCrypto) decrypt(data []byte) ([]byte, error) {
 
 var keyConfirmNonce = make([]byte, nonceSize)
 
-func keyConfirmMessage(clientPub, serverPub []byte) []byte {
-	msg := make([]byte, 0, len("OPENFLUX-KC")+64)
+func keyConfirmMessage(clientPub, serverPub []byte, clientCaps, serverCaps byte) []byte {
+	msg := make([]byte, 0, len("OPENFLUX-KC")+64+2)
 	msg = append(msg, "OPENFLUX-KC"...)
 	msg = append(msg, clientPub...)
 	msg = append(msg, serverPub...)
+	msg = append(msg, clientCaps, serverCaps)
 	return msg
 }
 
 // computeKeyConfirm produces the confirmation tag (caller: the side
 // answering HELLO).
-func (c *sessionCrypto) computeKeyConfirm(clientPub, serverPub []byte) []byte {
-	return c.kc.Seal(nil, keyConfirmNonce, keyConfirmMessage(clientPub, serverPub), nil)
+func (c *sessionCrypto) computeKeyConfirm(clientPub, serverPub []byte, clientCaps, serverCaps byte) []byte {
+	return c.kc.Seal(nil, keyConfirmNonce, keyConfirmMessage(clientPub, serverPub, clientCaps, serverCaps), nil)
 }
 
 // verifyKeyConfirm checks the tag (caller: the side that sent HELLO).
-func (c *sessionCrypto) verifyKeyConfirm(clientPub, serverPub, tag []byte) bool {
+func (c *sessionCrypto) verifyKeyConfirm(clientPub, serverPub []byte, clientCaps, serverCaps byte, tag []byte) bool {
 	plain, err := c.kc.Open(nil, keyConfirmNonce, tag, nil)
 	if err != nil {
 		return false
 	}
-	return bytes.Equal(plain, keyConfirmMessage(clientPub, serverPub))
+	return bytes.Equal(plain, keyConfirmMessage(clientPub, serverPub, clientCaps, serverCaps))
 }

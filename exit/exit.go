@@ -22,10 +22,10 @@ import (
 const maxConcurrentDials = 64
 
 type Server struct {
-	mux       *mux.Mux
-	dialer    net.Dialer
-	dialSem   chan struct{}
-	watchOnce sync.Once
+	mux    *mux.Mux
+	dialer net.Dialer
+	// dialSem caps concurrent outbound dials (see maxConcurrentDials).
+	dialSem chan struct{}
 }
 
 func NewServer(m *mux.Mux) *Server {
@@ -39,15 +39,18 @@ func NewServer(m *mux.Mux) *Server {
 }
 
 // Serve accepts streams until the mux is closed or ctx is cancelled.
-// The ctx watcher is registered once per Server, not per call, so
-// repeated Serve calls (session rebuilds) do not leak goroutines.
+// The watcher goroutine exits when Serve returns, so repeated Serve
+// calls (session rebuilds) do not leak goroutines.
 func (s *Server) Serve(ctx context.Context) error {
-	s.watchOnce.Do(func() {
-		go func() {
-			<-ctx.Done()
+	serveDone := make(chan struct{})
+	defer close(serveDone)
+	go func() {
+		select {
+		case <-ctx.Done():
 			s.mux.Close()
-		}()
-	})
+		case <-serveDone:
+		}
+	}()
 	for {
 		st, err := s.mux.Accept()
 		if err != nil {

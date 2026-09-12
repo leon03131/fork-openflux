@@ -209,12 +209,17 @@ func (m *Mux) Close() {
 func (m *Mux) Closed() <-chan struct{} { return m.closed }
 
 func (m *Mux) send(f wire.Frame) error {
+	return m.sendDeadline(f, time.Time{})
+}
+
+// sendDeadline sends a frame, bounding the session-queue wait.
+func (m *Mux) sendDeadline(f wire.Frame, deadline time.Time) error {
 	select {
 	case <-m.closed:
 		return ErrClosed
 	default:
 	}
-	return m.sess.SendFrame(f)
+	return m.sess.SendFrameDeadline(f, deadline)
 }
 
 func (m *Mux) removeStream(id uint32) {
@@ -388,9 +393,14 @@ type Stream struct {
 
 	openCh chan error // buffered (1)
 
-	mu          sync.Mutex
-	recvBuf     bytes.Buffer
-	readEOF     bool // peer half-closed; drained reads return io.EOF
+	mu      sync.Mutex
+	recvBuf bytes.Buffer
+	// readEOF: peer half-closed gracefully — drained reads return
+	// io.EOF (complete data). resetErr: stream aborted (CLOSE frame,
+	// session death) — drained reads return the error (data may be
+	// truncated). EOF is checked first, so a clean finish wins.
+	readEOF     bool
+	resetErr    error
 	closed      bool
 	writeClosed bool
 	sendWindow  int
@@ -550,8 +560,8 @@ func (s *Stream) remoteHalfClose() {
 
 func (s *Stream) remoteClose() {
 	s.mu.Lock()
-	s.readEOF = true
 	s.closed = true
+	s.resetErr = ErrStreamClosed
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -562,7 +572,7 @@ func (s *Stream) remoteClose() {
 func (s *Stream) closeNoSend() {
 	s.mu.Lock()
 	s.closed = true
-	s.readEOF = true
+	s.resetErr = ErrStreamClosed
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -622,6 +632,10 @@ func (s *Stream) Read(b []byte) (int, error) {
 			s.mu.Unlock()
 			return 0, io.EOF
 		}
+		if s.resetErr != nil {
+			s.mu.Unlock()
+			return 0, s.resetErr
+		}
 		if s.closed {
 			s.mu.Unlock()
 			return 0, ErrStreamClosed
@@ -644,6 +658,11 @@ func (s *Stream) Read(b []byte) (int, error) {
 }
 
 func (s *Stream) Write(b []byte) (int, error) {
+	// The write deadline bounds the WHOLE Write call, including the
+	// session queue wait — per net.Conn semantics.
+	if _, dl := s.writeDeadline.Wait(); !dl.IsZero() && time.Now().After(dl) {
+		return 0, errTimeout
+	}
 	total := 0
 	for total < len(b) {
 		s.mu.Lock()
@@ -682,7 +701,8 @@ func (s *Stream) Write(b []byte) (int, error) {
 		s.sendWindow -= n
 		s.mu.Unlock()
 
-		err := s.m.send(wire.Frame{Type: wire.TypeData, StreamID: s.id, Payload: b[total : total+n]})
+		_, wdl := s.writeDeadline.Wait()
+		err := s.m.sendDeadline(wire.Frame{Type: wire.TypeData, StreamID: s.id, Payload: b[total : total+n]}, wdl)
 		if err != nil {
 			// The frame was not sent: return the credit so the window
 			// accounting does not leak, and wake other writers.
@@ -707,6 +727,8 @@ func (s *Stream) CloseWrite() error {
 	}
 	s.writeClosed = true
 	s.mu.Unlock()
+	// Wake any writer blocked on an exhausted window.
+	notify(s.sendNotify)
 	return s.m.send(wire.Frame{Type: wire.TypeHalfClose, StreamID: s.id})
 }
 

@@ -141,7 +141,10 @@ func TestHalfClose(t *testing.T) {
 				st.AcceptOpen()
 				data, _ := io.ReadAll(st) // ends on client half-close
 				st.Write(append([]byte("got:"), data...))
-				st.Close()
+				// Graceful finish = CloseWrite (FIN semantics); Close
+				// alone would be an abortive reset.
+				st.CloseWrite()
+				defer st.Close()
 			}()
 		}
 	}()
