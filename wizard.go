@@ -141,8 +141,8 @@ func wizardArgs(in io.Reader, out io.Writer) ([]string, error) {
 			}
 			fmt.Fprintln(out, "  ! Адрес не может быть пустым.")
 		}
-	case 2, 3: // yandex -> "onlyoffice", mail -> "mail"
-		transportName, hint := "onlyoffice", "публичная ссылка на документ Яндекс Диска"
+	case 2, 3: // yandex -> auto-detect, mail -> "mail"
+		transportName, hint := "yandex", "публичная ссылка на документ Яндекс Диска (редактор определится сам)"
 		if carrier == 3 {
 			transportName, hint = "mail", "публичная ссылка на документ в Mail.ru Облаке"
 		}

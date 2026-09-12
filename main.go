@@ -30,7 +30,7 @@ import (
 	"github.com/leon03131/fork-openflux/transport/oneme"
 	"github.com/leon03131/fork-openflux/transport/onlyoffice"
 	"github.com/leon03131/fork-openflux/transport/volga"
-	"github.com/leon03131/fork-openflux/transport/yandex"
+	"github.com/leon03131/fork-openflux/transport/ydetect"
 	"github.com/leon03131/fork-openflux/tunnel"
 	"github.com/leon03131/fork-openflux/utils"
 )
@@ -188,10 +188,22 @@ func buildTransport(cfg *cliConfig) (transport.Transport, error) {
 
 	switch cfg.transportType {
 	case "yandex":
+		// Auto-detect the editor backend: volga (new editor) or
+		// onlyoffice. The legacy editor is gone provider-side.
 		if cfg.docURL == "" {
 			return nil, fmt.Errorf("--url is required for the yandex transport (Yandex Docs document URL)")
 		}
-		trans = yandex.NewYandexDocsTransport(cfg.docURL, config)
+		backend, err := ydetect.Probe(cfg.docURL)
+		if err != nil {
+			return nil, fmt.Errorf("yandex backend detection: %w", err)
+		}
+		log.Printf("Yandex backend detected: %s", backend)
+		switch backend {
+		case ydetect.BackendVolga:
+			trans = volga.NewVolgaTransport(cfg.docURL, config)
+		default:
+			trans = onlyoffice.NewOnlyOfficeTransport(cfg.docURL, config)
+		}
 	case "onlyoffice":
 		if cfg.docURL == "" {
 			return nil, fmt.Errorf("--url is required for the onlyoffice transport (Yandex Disk document URL)")
@@ -415,17 +427,33 @@ func runDoctor(cfg *cliConfig) error {
 
 	switch cfg.transportType {
 	case "yandex":
+		// Auto-detect editor backend, then run that backend's checks.
 		if cfg.docURL == "" {
 			check("--url present", flagMissing("not set"))
 			break
 		}
 		check("--url present", nil)
-		if err := yandex.CheckDoc(cfg.docURL); err != nil {
-			check("yandex doc config fetch", err)
+		backend, err := ydetect.Probe(cfg.docURL)
+		if err != nil {
+			check("yandex backend detection", err)
 			break
 		}
-		check("yandex doc config fetch", nil)
-		check("yandex live websocket handshake", yandex.CheckLive(cfg.docURL))
+		fmt.Printf("  [INFO] editor backend: %s\n", backend)
+		if backend == ydetect.BackendVolga {
+			if err := volga.CheckDoc(cfg.docURL); err != nil {
+				check("volga doc authorize", err)
+				break
+			}
+			check("volga doc authorize", nil)
+			check("volga live relay+websocket", volga.CheckLive(cfg.docURL))
+		} else {
+			if err := onlyoffice.CheckDoc(cfg.docURL); err != nil {
+				check("onlyoffice doc config fetch", err)
+				break
+			}
+			check("onlyoffice doc config fetch", nil)
+			check("onlyoffice live handshake", onlyoffice.CheckLive(cfg.docURL))
+		}
 	case "onlyoffice":
 		if cfg.docURL == "" {
 			check("--url present", flagMissing("not set"))
