@@ -149,6 +149,13 @@ func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 // MaxFramePayload is the largest DATA payload the mux may put in one frame.
 func (s *Session) MaxFramePayload() int { return s.frameBudget }
 
+// NegotiatedCaps returns the capability bits the peer advertised in
+// HELLO/HELLO_ACK (0 for a legacy peer or before the handshake). This is
+// informational metadata only: the bits are authenticated (bound into the
+// key-confirmation tag), but no behavior is gated on them yet — callers
+// must not treat them as enforcement.
+func (s *Session) NegotiatedCaps() uint32 { return s.peerCaps.Load() }
+
 // Start hooks the session into the transport. The caller owns the
 // transport lifecycle (it must be started before Start and stopped after
 // Close); a session never stops the transport, which allows the
@@ -234,8 +241,12 @@ func (s *Session) writerLoop() {
 				var err error
 				data, err = c.encrypt(data)
 				if err != nil {
+					// ChaCha20-Poly1305 Seal cannot fail in practice; if it
+					// ever does, a silently dropped frame would corrupt
+					// stream accounting. Die loudly instead.
 					utils.Debugf("[SESSION] encrypt failed: %v", err)
-					continue
+					s.CloseWithError(fmt.Errorf("session: encrypt: %w", err))
+					return
 				}
 			}
 			if err := s.trans.Send(data); err != nil {
@@ -254,7 +265,8 @@ func (s *Session) writerLoop() {
 			if s.closeErr != ErrClosed {
 				return
 			}
-			deadline := time.Now().Add(2 * time.Second)
+			deadline := time.NewTimer(2 * time.Second)
+			defer deadline.Stop()
 			for {
 				select {
 				case msg := <-s.sendQueue:
@@ -266,10 +278,14 @@ func (s *Session) writerLoop() {
 							}
 						}
 					}
-					s.trans.Send(data)
+					// Best-effort drain: the session is closing anyway, but
+					// log failures so a lost GOAWAY/CLOSE is diagnosable.
+					if err := s.trans.Send(data); err != nil {
+						utils.Debugf("[SESSION] drain: transport send failed: %v", err)
+					}
 				default:
 					return
-				case <-time.After(time.Until(deadline)):
+				case <-deadline.C:
 					return
 				}
 			}
@@ -284,10 +300,12 @@ func (s *Session) waitConnected(timeout time.Duration) error {
 		if time.Now().After(deadline) {
 			return ErrNotConnected
 		}
+		poll := time.NewTimer(20 * time.Millisecond)
 		select {
 		case <-s.closed:
+			poll.Stop()
 			return ErrClosed
-		case <-time.After(20 * time.Millisecond):
+		case <-poll.C:
 		}
 	}
 	return nil
@@ -317,6 +335,8 @@ func (s *Session) Handshake() error {
 			return fmt.Errorf("%w: send hello: %v", ErrHandshake, err)
 		}
 	}
+	helloTimer := time.NewTimer(HelloTimeout)
+	defer helloTimer.Stop()
 	select {
 	case err := <-s.helloCh:
 		if err != nil {
@@ -326,7 +346,7 @@ func (s *Session) Handshake() error {
 			s.CloseWithError(err)
 			return err
 		}
-	case <-time.After(HelloTimeout):
+	case <-helloTimer.C:
 		err := fmt.Errorf("%w: timeout", ErrHandshake)
 		s.CloseWithError(err)
 		return err
@@ -348,9 +368,11 @@ func (s *Session) Handshake() error {
 		// Both sides: Ready only after the peer proved PSK knowledge
 		// (first valid encrypted frame: client PING on exit, server PONG
 		// on client).
+		confirmTimer := time.NewTimer(HelloTimeout)
+		defer confirmTimer.Stop()
 		select {
 		case <-s.confirmCh:
-		case <-time.After(HelloTimeout):
+		case <-confirmTimer.C:
 			err := fmt.Errorf("%w: peer confirmation timeout", ErrHandshake)
 			s.CloseWithError(err)
 			return err
@@ -561,7 +583,9 @@ func (s *Session) SendFrameDeadline(f wire.Frame, deadline time.Time) error {
 	// behind a peer's deadline.
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
-		timeout = time.After(time.Until(deadline))
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		timeout = timer.C
 	}
 	select {
 	case s.sendQueue <- msg:

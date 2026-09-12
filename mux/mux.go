@@ -57,6 +57,9 @@ const (
 var (
 	ErrClosed       = errors.New("mux: closed")
 	ErrStreamClosed = errors.New("mux: stream closed")
+	// ErrPeerClosed resets a stream aborted by the peer's CLOSE frame
+	// without a prior half-close: the data may be truncated.
+	ErrPeerClosed   = errors.New("mux: peer closed the stream")
 	ErrWriteClosed  = errors.New("mux: write side closed")
 	ErrOpenTimeout  = errors.New("mux: open timed out")
 	ErrStreamExists = errors.New("mux: duplicate stream id")
@@ -73,6 +76,10 @@ type Mux struct {
 	mu      sync.Mutex
 	streams map[uint32]*Stream
 	nextID  uint32
+	// closeErr is the reason the mux died (e.g. the session's death
+	// cause); it flows into the resetErr of every stream torn down by
+	// the mux. nil = streams get the default ErrStreamClosed.
+	closeErr error
 
 	// buffered tracks unread stream payload bytes across all streams.
 	buffered atomic.Int64
@@ -102,10 +109,11 @@ func newMux(s *session.Session, firstID uint32) *Mux {
 	}
 	s.OnFrame(m.handleFrame)
 	// If the session dies, the mux must die too: wake all blocked
-	// Read/Write and fail Accept/Open.
+	// Read/Write and fail Accept/Open. The session's close reason is
+	// propagated into every live stream.
 	go func() {
 		<-s.Closed()
-		m.Close()
+		m.CloseWithError(s.Err())
 	}()
 	return m
 }
@@ -191,18 +199,47 @@ func (m *Mux) Accept() (*Stream, error) {
 	}
 }
 
-func (m *Mux) Close() {
+// Close shuts the mux down with the default stream reset reason
+// (ErrStreamClosed).
+func (m *Mux) Close() { m.CloseWithError(nil) }
+
+// CloseWithError is Close with a cause: err is propagated to every live
+// stream as its reset reason (a nil err keeps the default). The first
+// call wins.
+func (m *Mux) CloseWithError(err error) {
 	m.closeOnce.Do(func() {
+		if err != nil {
+			m.mu.Lock()
+			m.closeErr = err
+			m.mu.Unlock()
+		}
 		// GOAWAY first: once m.closed is closed, send() refuses to send.
 		m.sess.SendFrame(wire.Frame{Type: wire.TypeGoAway})
 		close(m.closed)
+		// Snapshot, then close WITHOUT holding m.mu: closeNoSend locks
+		// m.mu again (resetReason) — holding it here would self-deadlock.
 		m.mu.Lock()
+		streams := make([]*Stream, 0, len(m.streams))
 		for _, st := range m.streams {
-			st.closeNoSend()
+			streams = append(streams, st)
 		}
 		m.mu.Unlock()
+		for _, st := range streams {
+			st.closeNoSend()
+		}
 		m.sess.Close()
 	})
+}
+
+// resetReason reports the abort cause for streams torn down with the
+// mux: the mux close reason if set, ErrStreamClosed otherwise.
+func (m *Mux) resetReason() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closeErr != nil {
+		return m.closeErr
+	}
+	return ErrStreamClosed
 }
 
 // Closed returns a channel closed when the mux ends.
@@ -396,9 +433,13 @@ type Stream struct {
 	mu      sync.Mutex
 	recvBuf bytes.Buffer
 	// readEOF: peer half-closed gracefully — drained reads return
-	// io.EOF (complete data). resetErr: stream aborted (CLOSE frame,
+	// io.EOF (complete data). resetErr: stream aborted (peer CLOSE,
 	// session death) — drained reads return the error (data may be
-	// truncated). EOF is checked first, so a clean finish wins.
+	// truncated). resetErr is checked FIRST: an abort beats a graceful
+	// EOF — a half-close followed by carrier death means the tail of
+	// the data may have been lost in flight. A peer CLOSE after a
+	// half-close is still a clean finish and does NOT set resetErr
+	// (see remoteClose).
 	readEOF     bool
 	resetErr    error
 	closed      bool
@@ -563,10 +604,24 @@ func (s *Stream) remoteHalfClose() {
 	s.recvNotify.Ping()
 }
 
+// setResetLocked records the abort reason, first write wins: the
+// earliest failure is the root cause and must not be masked by later
+// teardown. Caller must hold s.mu.
+func (s *Stream) setResetLocked(err error) {
+	if s.resetErr == nil && err != nil {
+		s.resetErr = err
+	}
+}
+
 func (s *Stream) remoteClose() {
 	s.mu.Lock()
 	s.closed = true
-	s.resetErr = ErrStreamClosed
+	// A CLOSE after a half-close (FIN) is the peer's graceful teardown:
+	// the data up to the FIN is complete, so keep the clean EOF. A
+	// CLOSE out of the blue is an abortive reset (data truncated).
+	if !s.readEOF {
+		s.setResetLocked(ErrPeerClosed)
+	}
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -577,7 +632,7 @@ func (s *Stream) remoteClose() {
 func (s *Stream) closeNoSend() {
 	s.mu.Lock()
 	s.closed = true
-	s.resetErr = ErrStreamClosed
+	s.setResetLocked(s.m.resetReason())
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -629,13 +684,15 @@ func (s *Stream) Read(b []byte) (int, error) {
 			}
 			return n, nil
 		}
-		if s.readEOF {
-			s.mu.Unlock()
-			return 0, io.EOF
-		}
+		// An abortive reset beats a graceful EOF: after a half-close
+		// the carrier may still have died with data in flight.
 		if s.resetErr != nil {
 			s.mu.Unlock()
 			return 0, s.resetErr
+		}
+		if s.readEOF {
+			s.mu.Unlock()
+			return 0, io.EOF
 		}
 		if s.closed {
 			s.mu.Unlock()

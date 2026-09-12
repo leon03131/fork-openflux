@@ -214,6 +214,15 @@ func TestTamperedCiphertextRejected(t *testing.T) {
 	}
 }
 
+// NOTE: TestEncryptFailureKillsSession is intentionally omitted. The
+// encrypt error path in writerLoop (CloseWithError on failure) is
+// defensive: sessionCrypto.encrypt is built on cipher.AEAD.Seal, which
+// has no error return, so a real crypto can never fail there. Simulating
+// a failure would require turning Session.crypto into an interface (an
+// invasive refactor of every call site) or a mutable test hook in
+// production crypto code — both unjustified for an unreachable path.
+// If encrypt ever gains a fallible implementation, add the test.
+
 // cryptoPair returns client and server sessionCrypto with matching keys.
 func cryptoPair(t *testing.T) (*sessionCrypto, *sessionCrypto) {
 	t.Helper()

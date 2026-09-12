@@ -23,6 +23,14 @@ func newMuxPair(t *testing.T) (*Mux, *Mux) {
 // newMuxPairPSK is newMuxPair with an optional PSK (nil = plaintext).
 func newMuxPairPSK(t *testing.T, psk []byte) (*Mux, *Mux) {
 	t.Helper()
+	cm, sm, _, _ := newMuxPairSessions(t, psk)
+	return cm, sm
+}
+
+// newMuxPairSessions is newMuxPairPSK that also returns the underlying
+// sessions (client, server) for tests that kill a session directly.
+func newMuxPairSessions(t *testing.T, psk []byte) (*Mux, *Mux, *session.Session, *session.Session) {
+	t.Helper()
 	ta, tb := transport.NewMemoryTransportPair(transport.DefaultConfig())
 	if err := ta.Start(); err != nil {
 		t.Fatal(err)
@@ -61,7 +69,7 @@ func newMuxPairPSK(t *testing.T, psk []byte) (*Mux, *Mux) {
 		cm.Close()
 		sm.Close()
 	})
-	return cm, sm
+	return cm, sm, sa, sb
 }
 
 // echoAcceptor accepts streams and echoes everything back.
@@ -608,5 +616,117 @@ func TestDialTCPAdapter(t *testing.T) {
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSessionDeathPropagatesReason: when the session dies with a cause,
+// that cause (not a generic ErrStreamClosed / io.EOF) must surface from
+// stream Reads.
+func TestSessionDeathPropagatesReason(t *testing.T) {
+	cm, sm, csess, _ := newMuxPairSessions(t, nil)
+	go echoAcceptor(t, sm)
+
+	st, err := cm.Open("example.com", 443)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	// Sanity: the stream works before the kill.
+	if _, err := st.Write([]byte("x")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := io.ReadFull(st, make([]byte, 1)); err != nil {
+		t.Fatalf("Read before kill: %v", err)
+	}
+
+	csess.CloseWithError(errors.New("boom-test"))
+
+	// The next Read blocks until the session-death teardown lands, then
+	// must return the cause (the deadline is only an anti-hang guard).
+	st.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, err = st.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("Read must fail after session death")
+	}
+	if !strings.Contains(err.Error(), "boom-test") {
+		t.Fatalf("Read error must carry the session cause, got: %v", err)
+	}
+	if errors.Is(err, ErrStreamClosed) || errors.Is(err, io.EOF) {
+		t.Fatalf("Read returned a generic error instead of the cause: %v", err)
+	}
+}
+
+// TestHalfCloseThenDeathReturnsError: a graceful half-close followed by
+// session death must NOT report a clean EOF after the drain — the tail
+// of the data may have died with the carrier.
+func TestHalfCloseThenDeathReturnsError(t *testing.T) {
+	cm, sm, csess, _ := newMuxPairSessions(t, nil)
+
+	accepted := make(chan *Stream, 1)
+	go func() {
+		st, err := sm.Accept()
+		if err != nil {
+			return
+		}
+		st.AcceptOpen()
+		accepted <- st
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	sst := <-accepted
+
+	// The peer sends data, then gracefully half-closes (FIN).
+	if _, err := sst.Write([]byte("partial")); err != nil {
+		t.Fatalf("peer Write: %v", err)
+	}
+	if err := sst.CloseWrite(); err != nil {
+		t.Fatalf("peer CloseWrite: %v", err)
+	}
+
+	// Drain the data...
+	buf := make([]byte, 64)
+	n, err := st.Read(buf)
+	if err != nil || string(buf[:n]) != "partial" {
+		t.Fatalf("drain Read: n=%d err=%v", n, err)
+	}
+	// ...and wait for the half-close to actually arrive.
+	wait := time.Now().Add(5 * time.Second)
+	for {
+		st.mu.Lock()
+		eof := st.readEOF
+		st.mu.Unlock()
+		if eof {
+			break
+		}
+		if time.Now().After(wait) {
+			t.Fatal("half-close never arrived")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Now the session dies before any further data.
+	csess.CloseWithError(errors.New("boom-test"))
+
+	// Wait for the teardown to land on the stream: closedCh closes
+	// after resetErr is set (happens-before via the channel close).
+	// A Read issued earlier would race the mux's death goroutine and
+	// could legitimately still see the clean EOF.
+	select {
+	case <-st.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream was not torn down after session death")
+	}
+
+	_, err = st.Read(buf)
+	if err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("Read after half-close + session death must be an error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boom-test") {
+		t.Fatalf("Read error must carry the session cause, got: %v", err)
 	}
 }
