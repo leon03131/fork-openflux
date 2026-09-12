@@ -573,8 +573,6 @@ func startOutgoingCall(client *MaxClient, calleeID int64, onStateChange func(boo
 	// Callbacks are assigned before any goroutine starts (no race).
 	h.onStateChange = onStateChange
 	h.dcInbound = dcInbound
-	go h.dispatchLoop()
-	go h.signalingWriter()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -624,6 +622,10 @@ func startOutgoingCall(client *MaxClient, calleeID int64, onStateChange func(boo
 			h.handleCandidate(c)
 		}
 	}
+
+	// Goroutines start only after msgHandler is assigned.
+	go h.dispatchLoop()
+	go h.signalingWriter()
 
 	logInfo("[CALLER] Calling %d", calleeID)
 
@@ -719,8 +721,6 @@ func startIncomingListener(client *MaxClient, onStateChange func(bool), dcInboun
 	// Callbacks are assigned before any goroutine starts (no race).
 	h.onStateChange = onStateChange
 	h.dcInbound = dcInbound
-	go h.dispatchLoop()
-	go h.signalingWriter()
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -746,6 +746,10 @@ func startIncomingListener(client *MaxClient, onStateChange func(bool), dcInboun
 			h.handleCandidate(c)
 		}
 	}
+
+	// Goroutines start only after msgHandler is assigned.
+	go h.dispatchLoop()
+	go h.signalingWriter()
 
 	client.SetEventCallback(func(p MaxPacket) {
 		if p.Opcode == 137 {
