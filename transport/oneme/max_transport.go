@@ -55,27 +55,27 @@ func (t *OneMeTransport) Start() error {
 		return fmt.Errorf("max login: %w", err)
 	}
 
-	var ch *CallHandler
-	if t.exit {
-		utils.Debugf("configured ch for exit node")
-		ch = startIncomingListener(client)
-	} else {
-		utils.Debugf("configured ch for client mode")
-		ch = startOutgoingCall(client, t.uid)
-	}
-
-	ch.onStateChange = func(connected bool) {
+	// Callbacks are passed into the handler constructors so they are in
+	// place before any goroutine starts (no late-assignment race).
+	onStateChange := func(connected bool) {
 		t.b.SetConnected(connected)
 	}
-	// Sync the initial state: the callback may have missed an early
-	// transition fired before it was assigned.
-	t.b.SetConnected(ch.connected.Load())
-
-	utils.Debugf("configured dc inbound")
-	ch.dcInbound = func(data []byte) {
+	dcInbound := func(data []byte) {
 		t.b.RecordReceive(len(data))
 		t.b.CallReceive(data)
 	}
+
+	var ch *CallHandler
+	if t.exit {
+		utils.Debugf("configured ch for exit node")
+		ch = startIncomingListener(client, onStateChange, dcInbound)
+	} else {
+		utils.Debugf("configured ch for client mode")
+		ch = startOutgoingCall(client, t.uid, onStateChange, dcInbound)
+	}
+
+	// Sync the initial state in case an early transition already fired.
+	t.b.SetConnected(ch.connected.Load())
 
 	if err := t.b.Start(); err != nil {
 		ch.Close()

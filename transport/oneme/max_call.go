@@ -562,7 +562,7 @@ func (h *CallHandler) handleCandidate(c map[string]interface{}) {
 	h.bufferOrAddICE(c)
 }
 
-func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
+func startOutgoingCall(client *MaxClient, calleeID int64, onStateChange func(bool), dcInbound func([]byte)) *CallHandler {
 	h := &CallHandler{tag: "CALLER", role: "caller"}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	h.seq = 1
@@ -570,6 +570,9 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	h.msgCh = make(chan string, 1024)
 	h.outQueue = make(chan []byte, 1024)
 	h.done = make(chan struct{})
+	// Callbacks are assigned before any goroutine starts (no race).
+	h.onStateChange = onStateChange
+	h.dcInbound = dcInbound
 	go h.dispatchLoop()
 	go h.signalingWriter()
 	h.msgHandler = func(text string) {
@@ -706,13 +709,16 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	return h
 }
 
-func startIncomingListener(client *MaxClient) *CallHandler {
+func startIncomingListener(client *MaxClient, onStateChange func(bool), dcInbound func([]byte)) *CallHandler {
 	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	h.seq = 1
 	h.msgCh = make(chan string, 1024)
 	h.outQueue = make(chan []byte, 1024)
 	h.done = make(chan struct{})
+	// Callbacks are assigned before any goroutine starts (no race).
+	h.onStateChange = onStateChange
+	h.dcInbound = dcInbound
 	go h.dispatchLoop()
 	go h.signalingWriter()
 	h.msgHandler = func(text string) {

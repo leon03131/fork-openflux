@@ -131,11 +131,12 @@ func relay(conn net.Conn, st *mux.Stream) {
 		}
 	}()
 
-	// abort tears down both sides: an error must not surface as a FIN.
+	// abort tears down both sides: an error must not surface as a FIN
+	// (RST on the TCP side where the OS allows it).
 	abort := func(dir string, err error) {
 		utils.Debugf("[EXIT] stream %d relay %s aborted: %v", st.ID(), dir, err)
-		conn.Close()
-		st.Close()
+		utils.AbortConn(conn)
+		st.Close() // mux CLOSE frame = reset on the tunnel side
 	}
 
 	go func() {

@@ -264,8 +264,8 @@ func relay(client, target net.Conn) {
 		defer wg.Done()
 		if _, err := io.Copy(dst, src); err != nil && !errors.Is(err, io.EOF) {
 			utils.Debugf("[SOCKS5] relay %s aborted: %v", dir, err)
-			src.Close()
-			dst.Close()
+			utils.AbortConn(src) // RST, not a clean FIN
+			utils.AbortConn(dst)
 			return
 		}
 		closeWrite(dst)
