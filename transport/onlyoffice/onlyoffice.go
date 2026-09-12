@@ -43,6 +43,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -121,6 +122,12 @@ type OnlyOfficeTransport struct {
 	baseUserID  string
 
 	connectInFlight atomic.Int32
+
+	// started guards against a second Start(): a repeated call would
+	// spawn duplicate keepalive/writer/reconnect goroutines. Once true
+	// it stays true forever — restart after Stop() is not supported
+	// (Stop cancels the shared transport context). Guarded by Mu.
+	started bool
 }
 
 // MaxPayload is the raw message budget for the OnlyOffice carrier.
@@ -143,6 +150,14 @@ func NewOnlyOfficeTransport(url string, config transport.TransportConfig) *OnlyO
 }
 
 func (t *OnlyOfficeTransport) Start() error {
+	t.Mu.Lock()
+	if t.started {
+		t.Mu.Unlock()
+		return errors.New("onlyoffice: already started")
+	}
+	t.started = true
+	t.Mu.Unlock()
+
 	if err := t.BaseTransport.Start(); err != nil {
 		return err
 	}

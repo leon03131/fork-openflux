@@ -62,6 +62,7 @@ type YandexDocsTransport struct {
 	sentEcho *dedupRing
 
 	connectInFlight atomic.Int32
+	started         atomic.Bool
 }
 
 // dedupRingSize covers ~30s of echo latency at 130 msg/s.
@@ -122,6 +123,10 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 }
 
 func (t *YandexDocsTransport) Start() error {
+	// One start only; restart after Stop is unsupported.
+	if !t.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("yandex: already started")
+	}
 	if err := t.BaseTransport.Start(); err != nil {
 		return err
 	}

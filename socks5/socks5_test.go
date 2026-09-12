@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -248,5 +249,154 @@ func TestConnectIPv6(t *testing.T) {
 	}
 	if dialer.gotAddr != "[::1]:80" {
 		t.Fatalf("dialed %q, want [::1]:80", dialer.gotAddr)
+	}
+}
+
+// TestRelayPropagatesError: the client dies abruptly mid-data; the target
+// must observe the teardown (EOF/error), not hang waiting for more.
+func TestRelayPropagatesError(t *testing.T) {
+	targetServer, targetClient := net.Pipe()
+	defer targetServer.Close()
+	defer targetClient.Close()
+
+	dialer := &fakeDialer{conn: targetClient}
+	c := startTestServer(t, dialer)
+
+	socksGreeting(t, c)
+	if _, err := c.Write([]byte{0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 80}); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp := readReply(t, c)
+	if resp[1] != repSucceeded {
+		t.Fatalf("reply = %#x, want success", resp[1])
+	}
+
+	// Some data flows, then the client vanishes mid-stream.
+	go c.Write([]byte("partial"))
+	buf := make([]byte, 7)
+	if _, err := io.ReadFull(targetServer, buf); err != nil {
+		t.Fatalf("target read: %v", err)
+	}
+	c.Close()
+
+	// The target must see the closure promptly (a timeout = relay hung).
+	targetServer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := targetServer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("target must see the connection closed after client abort")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("target hung: client abort was not propagated")
+	}
+}
+
+// trackConn is an in-memory net.Conn that records Close/CloseWrite calls
+// and fails reads with readErr when set (io.EOF once closed otherwise).
+type trackConn struct {
+	readErr error
+
+	closed    chan struct{}
+	closeOnce sync.Once
+	wroteFin  chan struct{}
+	finOnce   sync.Once
+}
+
+func newTrackConn() *trackConn {
+	return &trackConn{closed: make(chan struct{}), wroteFin: make(chan struct{})}
+}
+
+func (c *trackConn) Read([]byte) (int, error) {
+	if c.readErr != nil {
+		return 0, c.readErr
+	}
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *trackConn) Write(b []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, io.ErrClosedPipe
+	default:
+		return len(b), nil
+	}
+}
+
+func (c *trackConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *trackConn) CloseWrite() error {
+	c.finOnce.Do(func() { close(c.wroteFin) })
+	return nil
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string { return "dummy" }
+func (a dummyAddr) String() string  { return string(a) }
+
+func (c *trackConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *trackConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *trackConn) SetDeadline(time.Time) error      { return nil }
+func (c *trackConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *trackConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestRelayAbortsOnError: a hard read failure (not EOF) must fully Close
+// BOTH sides; turning it into CloseWrite would disguise the abort as a
+// clean FIN.
+func TestRelayAbortsOnError(t *testing.T) {
+	client := newTrackConn()
+	client.readErr = errors.New("connection reset by peer")
+	target := newTrackConn()
+
+	done := make(chan struct{})
+	go func() {
+		relay(client, target)
+		close(done)
+	}()
+
+	select {
+	case <-target.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("target not closed after client failure")
+	}
+	select {
+	case <-target.wroteFin:
+		t.Fatal("abort propagated as CloseWrite (clean FIN); want full Close")
+	default:
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay hung after client failure")
+	}
+}
+
+// TestRelayCleanEOFHalfClose: a graceful EOF must still propagate as a
+// half-close (CloseWrite), exactly as before the error handling change.
+func TestRelayCleanEOFHalfClose(t *testing.T) {
+	client := newTrackConn()
+	target := newTrackConn()
+
+	done := make(chan struct{})
+	go func() {
+		relay(client, target)
+		close(done)
+	}()
+
+	// Client finishes gracefully: EOF -> CloseWrite on the target.
+	client.Close()
+	select {
+	case <-target.wroteFin:
+	case <-time.After(2 * time.Second):
+		t.Fatal("clean EOF must propagate as CloseWrite")
+	}
+
+	// The target answers the FIN with its own EOF; relay must terminate.
+	target.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay hung after clean shutdown")
 	}
 }

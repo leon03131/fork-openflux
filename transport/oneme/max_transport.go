@@ -2,6 +2,7 @@ package oneme
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/leon03131/fork-openflux/transport"
 	"github.com/leon03131/fork-openflux/utils"
@@ -12,6 +13,10 @@ type OneMeTransport struct {
 	token string
 	uid   int64
 	exit  bool
+
+	// started guards against a second Start. It is never reset: Stop
+	// shuts the transport down for good, restart is not supported.
+	started atomic.Bool
 
 	oneMeClient *MaxClient
 	ch          *CallHandler
@@ -35,40 +40,57 @@ func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transp
 }
 
 func (t *OneMeTransport) Start() error {
+	if !t.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("transport already started")
+	}
+
 	utils.Debugf("creating max client ...")
-	t.oneMeClient = NewMaxClient()
-	if err := t.oneMeClient.Connect(); err != nil {
+	client := NewMaxClient()
+	if err := client.Connect(); err != nil {
+		client.Close()
 		return fmt.Errorf("max connect: %w", err)
 	}
-	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
+	if err := client.LoginByToken(t.token); err != nil {
+		client.Close()
 		return fmt.Errorf("max login: %w", err)
 	}
 
+	var ch *CallHandler
 	if t.exit {
 		utils.Debugf("configured ch for exit node")
-		t.ch = startIncomingListener(t.oneMeClient)
+		ch = startIncomingListener(client)
 	} else {
 		utils.Debugf("configured ch for client mode")
-		t.ch = startOutgoingCall(t.oneMeClient, t.uid)
+		ch = startOutgoingCall(client, t.uid)
 	}
 
-	t.ch.onStateChange = func(connected bool) {
+	ch.onStateChange = func(connected bool) {
 		t.b.SetConnected(connected)
 	}
 	// Sync the initial state: the callback may have missed an early
 	// transition fired before it was assigned.
-	t.b.SetConnected(t.ch.connected.Load())
-
-	// Keep the main MAX websocket alive across drops.
-	go t.oneMeClient.Supervise(t.token)
+	t.b.SetConnected(ch.connected.Load())
 
 	utils.Debugf("configured dc inbound")
-	t.ch.dcInbound = func(data []byte) {
+	ch.dcInbound = func(data []byte) {
 		t.b.RecordReceive(len(data))
 		t.b.CallReceive(data)
 	}
 
-	return t.b.Start()
+	if err := t.b.Start(); err != nil {
+		ch.Close()
+		client.Close()
+		return err
+	}
+
+	// All fallible steps succeeded — publish to the transport.
+	t.oneMeClient = client
+	t.ch = ch
+
+	// Keep the main MAX websocket alive across drops.
+	go client.Supervise(t.token)
+
+	return nil
 }
 
 func (t *OneMeTransport) Stop() error {

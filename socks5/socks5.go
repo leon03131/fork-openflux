@@ -252,22 +252,27 @@ func (s *SOCKS5Server) writeReply(conn net.Conn, rep byte) error {
 }
 
 // relay copies data in both directions, propagating half-closes when the
-// underlying connections support CloseWrite.
-func relay(a, b net.Conn) {
+// underlying connections support CloseWrite. A clean EOF (nil error) is a
+// graceful end of stream and propagates as CloseWrite; any other error is
+// an abort and must NOT look like a clean FIN to the peer, so BOTH sides
+// are fully closed instead.
+func relay(client, target net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
+	relayOne := func(dst, src net.Conn, dir string) {
 		defer wg.Done()
-		io.Copy(b, a)
-		closeWrite(b)
-	}()
+		if _, err := io.Copy(dst, src); err != nil && !errors.Is(err, io.EOF) {
+			utils.Debugf("[SOCKS5] relay %s aborted: %v", dir, err)
+			src.Close()
+			dst.Close()
+			return
+		}
+		closeWrite(dst)
+	}
 
-	go func() {
-		defer wg.Done()
-		io.Copy(a, b)
-		closeWrite(a)
-	}()
+	go relayOne(target, client, "client->target")
+	go relayOne(client, target, "target->client")
 
 	wg.Wait()
 }

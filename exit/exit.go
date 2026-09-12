@@ -6,6 +6,7 @@ package exit
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -112,9 +113,11 @@ func (s *Server) handle(ctx context.Context, st *mux.Stream) {
 
 // relay copies in both directions with true TCP half-close semantics:
 // HALF_CLOSE never kills the opposite direction (a server may think for
-// a long time before answering). If the stream dies (session lost,
-// peer CLOSE), the destination connection is force-closed so both copy
-// goroutines terminate and the FD is released.
+// a long time before answering). A clean EOF (nil error) propagates as
+// CloseWrite; any other error is an abort and must NOT look like a clean
+// FIN to the peer, so BOTH sides are fully closed instead. If the stream
+// dies (session lost, peer CLOSE), the destination connection is also
+// force-closed so both copy goroutines terminate and the FD is released.
 func relay(conn net.Conn, st *mux.Stream) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -128,9 +131,19 @@ func relay(conn net.Conn, st *mux.Stream) {
 		}
 	}()
 
+	// abort tears down both sides: an error must not surface as a FIN.
+	abort := func(dir string, err error) {
+		utils.Debugf("[EXIT] stream %d relay %s aborted: %v", st.ID(), dir, err)
+		conn.Close()
+		st.Close()
+	}
+
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, st)
+		if _, err := io.Copy(conn, st); err != nil && !errors.Is(err, io.EOF) {
+			abort("stream->dest", err)
+			return
+		}
 		// Client finished sending: propagate EOF to the destination.
 		if tc, ok := conn.(interface{ CloseWrite() error }); ok {
 			tc.CloseWrite()
@@ -139,7 +152,10 @@ func relay(conn net.Conn, st *mux.Stream) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(st, conn)
+		if _, err := io.Copy(st, conn); err != nil && !errors.Is(err, io.EOF) {
+			abort("dest->stream", err)
+			return
+		}
 		// Destination finished: propagate EOF to the client.
 		st.CloseWrite()
 	}()

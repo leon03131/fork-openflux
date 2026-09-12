@@ -14,6 +14,14 @@ type TransportConfig struct {
 	KeepAliveInterval    time.Duration
 }
 
+// Transport is a message carrier. Semantics:
+//
+//   - Send(data) queues the message for delivery: nil means ACCEPTED into
+//     the queue, NOT delivered. Actual write errors surface asynchronously
+//     via disconnection (IsConnected=false → session teardown).
+//   - Start is single-use: a second call must return an error, and restart
+//     after Stop is unsupported.
+//   - Receive callbacks arrive in order, never concurrently.
 type Transport interface {
 	Start() error
 	Stop() error

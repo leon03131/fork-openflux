@@ -172,3 +172,114 @@ func TestExitDialCap(t *testing.T) {
 		t.Fatalf("expected \"dial failed\" rejection, got: %v", err)
 	}
 }
+
+// TestRelayPropagatesError: the client vanishes mid-stream (abrupt CLOSE,
+// not a graceful half-close); the exit must tear down the destination
+// connection so it observes the closure instead of hanging.
+func TestRelayPropagatesError(t *testing.T) {
+	// Destination that reads but never closes on its own.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := listener.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	clientMux, exitMux := newExitPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go NewServer(exitMux).Serve(ctx)
+
+	st, err := clientMux.DialTCP(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("DialTCP via exit: %v", err)
+	}
+
+	var target net.Conn
+	select {
+	case target = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("exit never dialed the destination")
+	}
+	defer target.Close()
+
+	// Some data flows, then the client aborts mid-stream.
+	if _, err := st.Write([]byte("partial")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	target.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(target, make([]byte, 7)); err != nil {
+		t.Fatalf("target read: %v", err)
+	}
+	st.Close()
+
+	// The destination must see the closure promptly (a timeout = relay
+	// hung or the abort was swallowed).
+	target.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := target.Read(make([]byte, 1)); err == nil {
+		t.Fatal("target must see the connection closed after client abort")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("target hung: client abort was not propagated")
+	}
+}
+
+// TestRelayTargetAbortNotCleanFIN checks the opposite direction: when the
+// destination dies with a hard error (TCP RST), the exit must fully Close
+// the stream — the client must see an abort error, not a clean EOF (FIN).
+func TestRelayTargetAbortNotCleanFIN(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		// Wait for the stream to be up and carrying data (so the RST
+		// cannot race the exit's dial), then abort the connection.
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Read(make([]byte, 1)); err != nil {
+			c.Close()
+			return
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			tc.SetLinger(0) // force RST, not a graceful FIN
+		}
+		c.Close()
+	}()
+
+	clientMux, exitMux := newExitPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go NewServer(exitMux).Serve(ctx)
+
+	st, err := clientMux.DialTCP(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("DialTCP via exit: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	st.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = st.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("client read must fail after destination abort")
+	}
+	if err == io.EOF {
+		t.Fatal("destination abort reached the client as a clean EOF (FIN); want an error")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("client hung: destination abort was not propagated")
+	}
+}
