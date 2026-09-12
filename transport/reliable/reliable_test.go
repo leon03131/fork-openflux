@@ -275,7 +275,7 @@ func waitDrained(t *testing.T, r *Transport) {
 }
 
 // TestReliableReconnect: the carrier dies mid-stream (DisconnectAfterN),
-// gets reconnected, and the link self-heals from retransmit snapshots
+// gets reconnected, and the link self-heals from the retransmit timer
 // with zero loss. Per the P0.1 Send contract, Send does NOT fail while
 // the carrier is down — frames buffer in the window and carrier errors
 // are swallowed (counted in TransmitErrors). Afterwards a NEW adapter
@@ -291,7 +291,7 @@ func TestReliableReconnect(t *testing.T) {
 	go func() {
 		for i := 0; i < total; i++ {
 			// Never fails while the window has room: carrier errors are
-			// swallowed and healed by the retransmit ticker.
+			// swallowed and healed by the retransmit timer.
 			if err := p.rb.Send(makeMsg(i, size)); err != nil {
 				t.Errorf("send %d: %v (must buffer, not fail)", i, err)
 				return
@@ -310,7 +310,7 @@ func TestReliableReconnect(t *testing.T) {
 	p.fb.SetConnected(false)
 	p.fb.Reconnect()
 
-	// Self-healing: the retransmit ticker re-sends the full snapshot once
+	// Self-healing: the retransmit timer re-sends the unacked window once
 	// the carrier is back; frames the peer already saw are deduped.
 	expectMessages(t, cA, 0, total, size)
 	expectNoExtra(t, cA)
@@ -456,7 +456,7 @@ func TestNewGeneration(t *testing.T) {
 	}
 
 	// Heal b->a (with B still on the old generation nothing flows
-	// spontaneously: both windows are empty and the tickers stay silent),
+	// spontaneously: both windows are empty and the timers stay silent),
 	// then inject a well-formed old-epoch-B message: it must NOT re-latch
 	// as the new peer generation — the epoch is on A's deny list. The
 	// sleep lets any ack signal pending from the fill phase fire and
@@ -1197,6 +1197,104 @@ func FuzzParseMessageMAC(f *testing.F) {
 			t.Fatalf("frames carry %d bytes from a %d-byte input", total, len(data))
 		}
 	})
+}
+
+// byteCounter wraps a FaultyTransport and counts every byte the adapter
+// successfully hands to the carrier — the true wire cost of the
+// reliability layer (including frames the fault injector later drops:
+// those cost wire bandwidth on a real link too).
+type byteCounter struct {
+	*transport.FaultyTransport
+	wireBytes atomic.Uint64
+}
+
+func (b *byteCounter) Send(data []byte) error {
+	err := b.FaultyTransport.Send(data)
+	if err == nil {
+		b.wireBytes.Add(uint64(len(data)))
+	}
+	return err
+}
+
+// TestNoQuadraticBlowup is THE regression test for the production
+// failure that killed the snapshot design: with a non-coalescing carrier
+// the wire traffic must stay LINEAR in the payload, not N×window.
+// Sustained 2000 × 1 KiB messages one way; total wire bytes (both
+// directions: data + retransmits + acks) must stay under 3× payload
+// without loss and under 5× with 10% loss in both directions. The old
+// snapshot-of-all-unacked-per-Send design would land at ~250× here.
+func TestNoQuadraticBlowup(t *testing.T) {
+	run := func(t *testing.T, dropProb, maxFactor float64) {
+		fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+		ca, cb := &byteCounter{FaultyTransport: fa}, &byteCounter{FaultyTransport: fb}
+		if err := fa.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := fb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { fa.Stop(); fb.Stop() })
+		ra := New(context.Background(), ca, testConfig())
+		rb := New(context.Background(), cb, testConfig())
+		if err := ra.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rb.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ra.Stop(); rb.Stop() })
+
+		ca.SetDrop(dropProb)
+		cb.SetDrop(dropProb)
+
+		const total, size = 2000, 1024
+		c := collect(rb, total)
+		for i := 0; i < total; i++ {
+			if err := ra.Send(makeMsg(i, size)); err != nil {
+				t.Fatalf("send %d: %v", i, err)
+			}
+		}
+		expectMessages(t, c, 0, total, size)
+		waitDrained(t, ra)
+		expectNoExtra(t, c) // also a 300 ms settle window for trailing acks
+
+		wire := ca.wireBytes.Load() + cb.wireBytes.Load()
+		payload := uint64(total * size)
+		factor := float64(wire) / float64(payload)
+		t.Logf("drop=%.2f: wire=%d payload=%d factor=%.2f (limit %.0f)",
+			dropProb, wire, payload, factor, maxFactor)
+		if factor > maxFactor {
+			t.Fatalf("wire bytes %d = %.2fx payload %d, want < %.0fx — quadratic blowup",
+				wire, factor, payload, maxFactor)
+		}
+	}
+	t.Run("NoLoss", func(t *testing.T) { run(t, 0, 3) })
+	t.Run("Loss10Percent", func(t *testing.T) { run(t, 0.10, 5) })
+}
+
+// TestThroughputRegression: 10 MiB through a pair must take well under
+// 30 s — on an in-memory carrier with the selective-repeat sender this
+// is a few seconds at most; the snapshot design burned the time
+// re-serializing the whole window per message.
+func TestThroughputRegression(t *testing.T) {
+	p := newPair(t)
+	const size = 4 * 1024
+	const total = (10 << 20) / size // 2560 messages = 10 MiB
+	c := collect(p.rb, total)
+
+	start := time.Now()
+	for i := 0; i < total; i++ {
+		if err := p.ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	expectMessages(t, c, 0, total, size)
+	waitDrained(t, p.ra)
+	d := time.Since(start)
+	t.Logf("10 MiB through the pair in %v (%.1f MiB/s)", d, 10/d.Seconds())
+	if d > 30*time.Second {
+		t.Fatalf("10 MiB took %v, want < 30s", d)
+	}
 }
 
 // --- benchmarks: adapter overhead vs raw carrier ---
