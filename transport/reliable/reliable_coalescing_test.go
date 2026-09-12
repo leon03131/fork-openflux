@@ -44,6 +44,12 @@ type LatestStateTransport struct {
 	published atomic.Uint64 // non-empty slot flushes (<= sends; the gap IS the coalescing)
 }
 
+// SetDup sets the duplicate probability (race-safe).
+func (l *LatestStateTransport) SetDup(p float64) { l.mu.Lock(); l.DupProb = p; l.mu.Unlock() }
+
+// SetCorrupt sets the corruption probability (race-safe).
+func (l *LatestStateTransport) SetCorrupt(p float64) { l.mu.Lock(); l.CorruptProb = p; l.mu.Unlock() }
+
 // NewLatestStatePair creates two connected coalescing endpoints publishing
 // every flushInterval.
 func NewLatestStatePair(config transport.TransportConfig, flushInterval time.Duration) (*LatestStateTransport, *LatestStateTransport) {
@@ -220,8 +226,10 @@ func TestLatestStateSlotOverwrite(t *testing.T) {
 // overwritten before publication.
 func TestCoalescingBidirectional(t *testing.T) {
 	la, lb := NewLatestStatePair(transport.DefaultConfig(), 2*time.Millisecond)
-	la.DupProb, la.CorruptProb = 0.15, 0.05
-	lb.DupProb, lb.CorruptProb = 0.15, 0.05
+	la.SetDup(0.15)
+	la.SetCorrupt(0.05)
+	lb.SetDup(0.15)
+	lb.SetCorrupt(0.05)
 	if err := la.Start(); err != nil {
 		t.Fatal(err)
 	}

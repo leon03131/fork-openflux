@@ -81,6 +81,31 @@ func NewFaultyPair(config TransportConfig) (*FaultyTransport, *FaultyTransport) 
 	return a, b
 }
 
+// Race-safe setters for the fault knobs (callable while traffic flows;
+// the race detector will flag direct field writes otherwise).
+
+// SetDrop sets the drop probability.
+func (f *FaultyTransport) SetDrop(p float64) { f.mu.Lock(); f.DropProb = p; f.mu.Unlock() }
+
+// SetDup sets the duplicate probability.
+func (f *FaultyTransport) SetDup(p float64) { f.mu.Lock(); f.DupProb = p; f.mu.Unlock() }
+
+// SetCorrupt sets the corruption probability.
+func (f *FaultyTransport) SetCorrupt(p float64) { f.mu.Lock(); f.CorruptProb = p; f.mu.Unlock() }
+
+// SetDisconnectAfterN sets the disconnect trip wire.
+func (f *FaultyTransport) SetDisconnectAfterN(n int) {
+	f.mu.Lock()
+	f.DisconnectAfterN = n
+	f.mu.Unlock()
+}
+
+// SetFailSendAfterN sets the send-failure trip wire.
+func (f *FaultyTransport) SetFailSendAfterN(n int) { f.mu.Lock(); f.FailSendAfterN = n; f.mu.Unlock() }
+
+// SetDelayMS sets the uniform delivery delay in milliseconds.
+func (f *FaultyTransport) SetDelayMS(n int) { f.mu.Lock(); f.DelayMS = n; f.mu.Unlock() }
+
 func (f *FaultyTransport) Start() error {
 	f.mu.Lock()
 	if f.started {

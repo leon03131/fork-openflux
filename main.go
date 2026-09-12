@@ -340,8 +340,8 @@ func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error
 		// cap uses defaults; snapshot-fit against the carrier budget is
 		// centralized inside reliable (windowByteBudget).
 		rcfg := reliable.Config{
-			ChannelID:  reliable.DeriveChannelID([]byte(cfg.psk)),
-			MacKey:     reliable.DeriveMACKey([]byte(cfg.psk)),
+			ChannelID: reliable.DeriveChannelID([]byte(cfg.psk)),
+			MacKey:    reliable.DeriveMACKey([]byte(cfg.psk)),
 		}
 		rel = reliable.New(ctx, trans, rcfg)
 		trans = rel

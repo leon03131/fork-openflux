@@ -129,8 +129,8 @@ func expectNoExtra(t *testing.T, c *collector) {
 // acks). All 500 messages must arrive, strictly in order.
 func TestReliableUnderDrops(t *testing.T) {
 	p := newPair(t)
-	p.fa.DropProb = 0.3
-	p.fb.DropProb = 0.3
+	p.fa.SetDrop(0.3)
+	p.fb.SetDrop(0.3)
 
 	const total, size = 500, 512
 	c := collect(p.rb, total)
@@ -148,8 +148,8 @@ func TestReliableUnderDrops(t *testing.T) {
 // single duplicate may reach the upper layer.
 func TestReliableUnderDuplicates(t *testing.T) {
 	p := newPair(t)
-	p.fa.DupProb = 0.3
-	p.fb.DupProb = 0.3
+	p.fa.SetDup(0.3)
+	p.fb.SetDup(0.3)
 
 	const total, size = 500, 512
 	c := collect(p.rb, total)
@@ -166,8 +166,10 @@ func TestReliableUnderDuplicates(t *testing.T) {
 // with traffic in BOTH directions (ack piggybacking under load).
 func TestReliableDropAndDup(t *testing.T) {
 	p := newPair(t)
-	p.fa.DropProb, p.fa.DupProb = 0.2, 0.2
-	p.fb.DropProb, p.fb.DupProb = 0.2, 0.2
+	p.fa.SetDrop(0.2)
+	p.fa.SetDup(0.2)
+	p.fb.SetDrop(0.2)
+	p.fb.SetDup(0.2)
 
 	const totalAB, sizeAB = 500, 512
 	const totalBA, sizeBA = 100, 256
@@ -202,8 +204,8 @@ func TestReliableDropAndDup(t *testing.T) {
 // layer must see only intact messages.
 func TestReliableUnderCorruption(t *testing.T) {
 	p := newPair(t)
-	p.fa.CorruptProb = 0.1
-	p.fb.CorruptProb = 0.1
+	p.fa.SetCorrupt(0.1)
+	p.fb.SetCorrupt(0.1)
 
 	const total, size = 500, 512
 	c := collect(p.rb, total)
@@ -281,7 +283,7 @@ func waitDrained(t *testing.T, r *Transport) {
 // generation are dropped.
 func TestReliableReconnect(t *testing.T) {
 	p := newPair(t)
-	p.fb.DisconnectAfterN = 50 // b's carrier dies after 50 sends
+	p.fb.SetDisconnectAfterN(50) // b's carrier dies after 50 sends
 
 	const total, size = 100, 256
 	cA := collect(p.ra, total)
@@ -406,7 +408,7 @@ func TestNewGeneration(t *testing.T) {
 	oldEpochB := p.rb.epoch
 
 	// Fill A's window with the ack path down and park a blocked Sender.
-	p.fb.DropProb = 1.0
+	p.fb.SetDrop(1.0)
 	payload := makeMsg(0, 512)
 	for i := 0; i < DefaultMaxUnackedFrames; i++ {
 		if err := p.ra.Send(payload); err != nil {
@@ -459,7 +461,7 @@ func TestNewGeneration(t *testing.T) {
 	// as the new peer generation — the epoch is on A's deny list. The
 	// sleep lets any ack signal pending from the fill phase fire and
 	// settle first, so the drop baseline below is exact.
-	p.fb.DropProb = 0
+	p.fb.SetDrop(0)
 	time.Sleep(100 * time.Millisecond)
 	drops := p.ra.Dropped()
 	if err := p.fb.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochB, 999, 1, []byte("STALE-B"))); err != nil {
@@ -699,14 +701,30 @@ func TestDoubleRotationDenyHistory(t *testing.T) {
 	epochB0 := p.rb.epoch
 	p.rb.mu.Unlock()
 
+	// Wait until A has actually latched B's epoch (the ACK arrives
+	// asynchronously); otherwise the deny history lacks B0.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.ra.mu.Lock()
+		latched := p.ra.peerEpochSet && p.ra.peerEpoch == epochB0
+		p.ra.mu.Unlock()
+		if latched {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A never latched B's epoch")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	// A rotates twice without B.
 	p.ra.NewGeneration()
 	p.ra.NewGeneration()
 
-	// Inject a frame from B's OLD epoch into A: must be dropped (deny
-	// history covers it), and A must not latch it as a new peer.
+	// Inject a frame from B's OLD epoch INTO A (fb sends → fa receives):
+	// must be dropped (deny history covers it), and A must not latch it.
 	stale := craftMessageV2([channelIDSize]byte{}, nil, epochB0, 0, 1, []byte("stale"))
-	p.fa.Send(stale) // fa delivers to A
+	p.fb.Send(stale) // B's carrier → A
 
 	p.ra.mu.Lock()
 	latched := p.ra.peerEpochSet && p.ra.peerEpoch == epochB0
@@ -738,7 +756,7 @@ func TestSnapshotFitsCarrierBudget(t *testing.T) {
 	const innerMax = 256 * 1024 // FaultyTransport.MaxPayload
 
 	p := newPair(t)
-	p.fb.DropProb = 1.0 // pin everything in the window
+	p.fb.SetDrop(1.0) // pin everything in the window
 
 	// Fill with a realistic size mix until the window refuses more.
 	sizes := []int{100, 1000, 5000, 20000}
@@ -794,7 +812,7 @@ loop:
 	}
 
 	// And a MaxPayload message round-trips end to end.
-	p.fb.DropProb = 0
+	p.fb.SetDrop(0)
 	waitDrained(t, p.ra)
 	c := collect(p.rb, 1)
 	big := makeMsg(777, p.ra.MaxPayload())
@@ -816,7 +834,7 @@ loop:
 func TestReliableBackpressure(t *testing.T) {
 	t.Run("FrameBoundBlocksAndHeals", func(t *testing.T) {
 		p := newPair(t)
-		p.fb.DropProb = 1.0 // no ack ever reaches a
+		p.fb.SetDrop(1.0) // no ack ever reaches a
 
 		const window = DefaultMaxUnackedFrames
 		// 512 B payloads: 256*(512+12) = 134,144 wire bytes, well under
@@ -847,7 +865,7 @@ func TestReliableBackpressure(t *testing.T) {
 			t.Fatalf("unackedBytes=%d, want %d (wire accounting)", b, want)
 		}
 
-		p.fb.DropProb = 0 // heal the ack path
+		p.fb.SetDrop(0) // heal the ack path
 		select {
 		case err := <-done:
 			if err != nil {
@@ -862,7 +880,7 @@ func TestReliableBackpressure(t *testing.T) {
 
 	t.Run("ByteBound", func(t *testing.T) {
 		p := newPair(t)
-		p.fb.DropProb = 1.0
+		p.fb.SetDrop(1.0)
 
 		// Wire accounting: each frame costs frameHeader+payload, and the
 		// byte budget is min(MaxUnackedBytes, what fits one snapshot on
@@ -920,7 +938,7 @@ func TestReliableBackpressure(t *testing.T) {
 		}
 		defer ra.Stop()
 		defer rb.Stop()
-		fb.DropProb = 1.0 // no ack ever reaches ra
+		fb.SetDrop(1.0) // no ack ever reaches ra
 
 		payload := makeMsg(0, 512)
 		for i := 0; i < DefaultMaxUnackedFrames; i++ {
@@ -967,7 +985,7 @@ func TestReliableBackpressure(t *testing.T) {
 	t.Run("CtxCancelUnblocks", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		p := newPairCtx(t, ctx)
-		p.fb.DropProb = 1.0
+		p.fb.SetDrop(1.0)
 
 		payload := makeMsg(0, 512)
 		for i := 0; i < DefaultMaxUnackedFrames; i++ {
@@ -991,7 +1009,7 @@ func TestReliableBackpressure(t *testing.T) {
 
 	t.Run("StopUnblocks", func(t *testing.T) {
 		p := newPair(t)
-		p.fb.DropProb = 1.0
+		p.fb.SetDrop(1.0)
 
 		payload := makeMsg(0, 512)
 		for i := 0; i < DefaultMaxUnackedFrames; i++ {

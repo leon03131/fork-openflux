@@ -52,7 +52,7 @@ func TestSessionDiesOnDrops(t *testing.T) {
 	_ = sa
 	sb.OnFrame(func(wire.Frame) {})
 
-	ta.DropProb = 1.0 // 100% packet loss c->s
+	ta.SetDrop(1.0) // 100% packet loss c->s
 
 	for i := 0; i < 3; i++ {
 		sa.SendFrame(wire.Frame{Type: wire.TypeData, StreamID: 1, Payload: []byte("x")})
@@ -67,7 +67,7 @@ func TestSessionDiesOnDrops(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	// Restore delivery: the next frame has a sequence gap -> fatal.
-	ta.DropProb = 0
+	ta.SetDrop(0)
 	sa.SendFrame(wire.Frame{Type: wire.TypeData, StreamID: 1, Payload: []byte("x")})
 
 	select {
@@ -84,7 +84,7 @@ func TestSessionDiesOnDuplicates(t *testing.T) {
 	sa, sb, ta, _ := newFaultySessionPair(t)
 	sb.OnFrame(func(wire.Frame) {})
 
-	ta.DupProb = 1.0
+	ta.SetDup(1.0)
 	sa.SendFrame(wire.Frame{Type: wire.TypeData, StreamID: 1, Payload: []byte("x")})
 
 	select {
@@ -101,7 +101,7 @@ func TestSessionDiesOnCorruption(t *testing.T) {
 	sa, sb, ta, _ := newFaultySessionPair(t)
 	sb.OnFrame(func(wire.Frame) {})
 
-	ta.CorruptProb = 1.0
+	ta.SetCorrupt(1.0)
 	for i := 0; i < maxDecryptFailures; i++ {
 		sa.SendFrame(wire.Frame{Type: wire.TypeData, StreamID: 1, Payload: []byte("x")})
 	}

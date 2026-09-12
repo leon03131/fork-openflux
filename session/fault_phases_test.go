@@ -87,7 +87,7 @@ func recvHandshakeErr(t *testing.T, errA, errB chan error) (clientErr, exitErr e
 // Slow: ~15s (HelloTimeout on both sides, running concurrently).
 func TestDisconnectDuringHello(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
-	tb.DisconnectAfterN = 0 // exit link is down from the very start
+	tb.SetDisconnectAfterN(0) // exit link is down from the very start
 	startPhasePair(t, sa, sb, ta, tb)
 
 	if tb.IsConnected() {
@@ -124,7 +124,7 @@ func TestDisconnectDuringHello(t *testing.T) {
 // Slow: ~15s (HelloTimeout on both sides, running concurrently).
 func TestDisconnectDuringHelloAck(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
-	ta.DisconnectAfterN = 1 // client link dies right after HELLO leaves
+	ta.SetDisconnectAfterN(1) // client link dies right after HELLO leaves
 	startPhasePair(t, sa, sb, ta, tb)
 
 	errA, errB := handshakeAsync(sa, sb)
@@ -153,7 +153,7 @@ func TestDisconnectDuringHelloAck(t *testing.T) {
 // so the test really waits out the full confirmation timeout.
 func TestDisconnectDuringConfirmation(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
-	tb.DisconnectAfterN = 1 // exit link dies right after HELLO_ACK
+	tb.SetDisconnectAfterN(1) // exit link dies right after HELLO_ACK
 	startPhasePair(t, sa, sb, ta, tb)
 
 	errA, errB := handshakeAsync(sa, sb)
@@ -191,7 +191,7 @@ func TestDisconnectDuringConfirmation(t *testing.T) {
 // test's DATA frame — is the one that fails. Fast test (<1s).
 func TestCarrierSendErrorKillsSession(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
-	ta.FailSendAfterN = 2 // budget covers HELLO + confirmation PING
+	ta.SetFailSendAfterN(2) // budget covers HELLO + confirmation PING
 	startPhasePair(t, sa, sb, ta, tb)
 
 	// Handshake must succeed: sends #1 (HELLO) and #2 (PING) are allowed.
@@ -221,7 +221,7 @@ func TestCarrierSendErrorKillsSession(t *testing.T) {
 // would reorder). Slow: ~15s (HelloTimeout).
 func TestSlowCarrierHandshakeTimeout(t *testing.T) {
 	sa, sb, ta, tb := newFaultyPhasePair(t)
-	ta.DelayMS = 16000 // HELLO arrives after the 15s handshake deadline
+	ta.SetDelayMS(16000) // HELLO arrives after the 15s handshake deadline
 	startPhasePair(t, sa, sb, ta, tb)
 
 	errA, errB := handshakeAsync(sa, sb)

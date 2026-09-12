@@ -72,9 +72,12 @@ func TestSoak(t *testing.T) {
 	ta, tb := transport.NewFaultyPair(transport.DefaultConfig())
 	// Soft random faults in both directions: every one of them breaks the
 	// reliable+ordered carrier contract eventually, killing the session.
-	ta.DropProb, tb.DropProb = 0.01, 0.01
-	ta.DupProb, tb.DupProb = 0.01, 0.01
-	ta.CorruptProb, tb.CorruptProb = 0.005, 0.005
+	ta.SetDrop(0.01)
+	tb.SetDrop(0.01)
+	ta.SetDup(0.01)
+	tb.SetDup(0.01)
+	ta.SetCorrupt(0.005)
+	tb.SetCorrupt(0.005)
 	if err := ta.Start(); err != nil {
 		t.Fatal(err)
 	}
