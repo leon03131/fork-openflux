@@ -491,6 +491,108 @@ func TestOpenRateLimit(t *testing.T) {
 	t.Logf("rate limiter: %d accepted, %d rejected", succeeded, rateLimited)
 }
 
+// TestConcurrentWritesWithDeadlines: several writers with different
+// deadlines on a window-exhausted stream; each must finish by its own
+// deadline, not hang behind another's.
+func TestConcurrentWritesWithDeadlines(t *testing.T) {
+	cm, sm := newMuxPair(t)
+	go func() {
+		for {
+			st, err := sm.Accept()
+			if err != nil {
+				return
+			}
+			st.AcceptOpen() // never reads: window exhausts
+		}
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	// Exhaust the window.
+	st.mu.Lock()
+	st.sendWindow = 0
+	st.mu.Unlock()
+
+	var wg sync.WaitGroup
+	// Writer 1: long deadline. Writer 2: short deadline — must fire first.
+	start := time.Now()
+	wg.Add(2)
+	var e1, e2 error
+	go func() { defer wg.Done(); _, e1 = st.Write([]byte("aaaa")) }()
+	go func() { defer wg.Done(); _, e2 = st.Write([]byte("bb")) }()
+
+	time.Sleep(50 * time.Millisecond) // both blocked
+	st.SetWriteDeadline(start.Add(300 * time.Millisecond))
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writers stuck behind each other's deadline")
+	}
+	for _, e := range []error{e1, e2} {
+		if !errors.Is(e, os.ErrDeadlineExceeded) {
+			t.Fatalf("want deadline exceeded, got %v", e)
+		}
+	}
+}
+
+// TestCloseWriteWakesBlockedWriters: writers blocked on an exhausted
+// window must wake when the write side is closed.
+func TestCloseWriteWakesBlockedWriters(t *testing.T) {
+	cm, sm := newMuxPair(t)
+	go func() {
+		for {
+			st, err := sm.Accept()
+			if err != nil {
+				return
+			}
+			st.AcceptOpen()
+		}
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	st.mu.Lock()
+	st.sendWindow = 0
+	st.mu.Unlock()
+
+	const writers = 3
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	errs := make([]error, writers)
+	for i := 0; i < writers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = st.Write([]byte("x"))
+		}(i)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	st.CloseWrite()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		for i := range errs {
+			if !errors.Is(errs[i], ErrWriteClosed) && !errors.Is(errs[i], ErrStreamClosed) {
+				t.Fatalf("writer %d: unexpected error %v", i, errs[i])
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseWrite did not wake blocked writers")
+	}
+}
+
 func TestDialTCPAdapter(t *testing.T) {
 	cm, sm := newMuxPair(t)
 	go echoAcceptor(t, sm)

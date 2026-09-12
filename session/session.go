@@ -81,15 +81,13 @@ type Session struct {
 	handler   func(wire.Frame)
 	handlerMu sync.RWMutex
 
-	// sendMu serializes encode -> encrypt(seq allocation) -> queue
-	// insertion, so queue order always matches sequence order even with
-	// concurrent SendFrame callers.
-	sendMu sync.Mutex
-
 	// sendQueue feeds the single writer goroutine; this keeps the
 	// inbound dispatch path non-blocking even when the carrier write
-	// stalls (no lock is ever held across a network write).
-	sendQueue chan []byte
+	// stalls (no lock is ever held across a network write). Encryption
+	// happens inside the writer (single goroutine), so AEAD sequence
+	// allocation order always equals queue order — no mutex is held
+	// across the (potentially long) queue wait.
+	sendQueue chan outMsg
 
 	lastRecvNano atomic.Int64
 	closed       chan struct{}
@@ -123,7 +121,7 @@ func New(t transport.Transport, psk []byte, isClient bool) (*Session, error) {
 		maxPayload: maxP,
 		psk:        psk,
 		isClient:   isClient,
-		sendQueue:  make(chan []byte, sendQueueSize),
+		sendQueue:  make(chan outMsg, sendQueueSize),
 		closed:     make(chan struct{}),
 		helloCh:    make(chan error, 1),
 		confirmCh:  make(chan struct{}),
@@ -227,7 +225,20 @@ func (s *Session) writerLoop() {
 				}
 			default:
 			}
-			if err := s.trans.Send(msg); err != nil {
+			data := msg.buf
+			if msg.encrypt {
+				c := s.crypto.Load()
+				if c == nil {
+					continue // crypto was expected but not ready; drop
+				}
+				var err error
+				data, err = c.encrypt(data)
+				if err != nil {
+					utils.Debugf("[SESSION] encrypt failed: %v", err)
+					continue
+				}
+			}
+			if err := s.trans.Send(data); err != nil {
 				// Carriers are reliable-ordered by contract; a send
 				// failure means the carrier is broken, and silently
 				// dropping the frame would corrupt stream accounting.
@@ -247,7 +258,15 @@ func (s *Session) writerLoop() {
 			for {
 				select {
 				case msg := <-s.sendQueue:
-					s.trans.Send(msg)
+					data := msg.buf
+					if msg.encrypt {
+						if c := s.crypto.Load(); c != nil {
+							if enc, err := c.encrypt(data); err == nil {
+								data = enc
+							}
+						}
+					}
+					s.trans.Send(data)
 				default:
 					return
 				case <-time.After(time.Until(deadline)):
@@ -412,15 +431,14 @@ func (s *Session) dispatch(f wire.Frame) {
 				s.failHello(err)
 				return
 			}
-			// Capabilities are part of the confirmed transcript.
-			caps := s.peerCaps.Load()
+			// Compatibility is both wire length AND crypto content:
+			// a legacy HELLO gets a legacy tag (no caps); a v2 HELLO
+			// gets caps bound into the tag.
+			peerHasCaps := len(f.Payload) == 34
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
-			tag := c.computeKeyConfirm(clientPub, serverPub, byte(caps), ourCapabilities)
-			// Answer in the peer's format: a legacy HELLO (33 bytes, no
-			// caps) gets a legacy ACK (124 bytes), so partial compat
-			// actually works in both directions.
+			tag := c.computeKeyConfirm(clientPub, serverPub, byte(s.peerCaps.Load()), ourCapabilities, peerHasCaps)
 			ackPayload := append([]byte{roleByte(s.isClient)}, s.priv.PublicKey().Bytes()...)
-			if len(f.Payload) == 34 {
+			if peerHasCaps {
 				ackPayload = append(ackPayload, ourCapabilities)
 			}
 			ackPayload = append(ackPayload, tag...)
@@ -448,8 +466,11 @@ func (s *Session) dispatch(f wire.Frame) {
 			if s.crypto.Load() != nil {
 				return // duplicate HELLO_ACK
 			}
-			// [role][server pubkey][optional caps][key confirmation tag]
-			if len(f.Payload) != 1+32+keyConfirmTagLen && len(f.Payload) != 1+32+1+keyConfirmTagLen {
+			// Two accepted forms: legacy [role][pub][tag91] (124) and
+			// v2 [role][pub][caps][tag93] (127).
+			legacyLen := 1 + 32 + keyConfirmTagLenLegacy
+			v2Len := 1 + 32 + 1 + keyConfirmTagLenV2
+			if len(f.Payload) != legacyLen && len(f.Payload) != v2Len {
 				s.failHello(fmt.Errorf("bad HELLO_ACK length %d", len(f.Payload)))
 				return
 			}
@@ -458,8 +479,9 @@ func (s *Session) dispatch(f wire.Frame) {
 				return
 			}
 			peerPub := f.Payload[1:33]
+			hasCaps := len(f.Payload) == v2Len
 			tagOffset := 33
-			if len(f.Payload) == 1+32+1+keyConfirmTagLen {
+			if hasCaps {
 				s.peerCaps.Store(uint32(f.Payload[33]))
 				tagOffset = 34
 			}
@@ -469,7 +491,7 @@ func (s *Session) dispatch(f wire.Frame) {
 				return
 			}
 			clientPub, serverPub := orderPubs(s.priv.PublicKey().Bytes(), peerPub, s.isClient)
-			if !c.verifyKeyConfirm(clientPub, serverPub, ourCapabilities, byte(s.peerCaps.Load()), f.Payload[tagOffset:]) {
+			if !c.verifyKeyConfirm(clientPub, serverPub, ourCapabilities, byte(s.peerCaps.Load()), hasCaps, f.Payload[tagOffset:]) {
 				s.failHello(errors.New("key confirmation failed (PSK mismatch?)"))
 				return
 			}
@@ -505,6 +527,13 @@ func (s *Session) OnFrame(cb func(wire.Frame)) {
 	s.handlerMu.Unlock()
 }
 
+// outMsg is a queued outbound frame; the writer encrypts it if
+// encryption was active at enqueue time.
+type outMsg struct {
+	buf     []byte
+	encrypt bool
+}
+
 func (s *Session) SendFrame(f wire.Frame) error {
 	return s.SendFrameDeadline(f, time.Time{})
 }
@@ -524,32 +553,22 @@ func (s *Session) SendFrameDeadline(f wire.Frame, deadline time.Time) error {
 	if err != nil {
 		return err
 	}
-	// Serialized: the sequence allocated in encrypt() must match the
-	// position in the queue, otherwise a concurrent sender could
-	// enqueue a higher seq first and the peer would report a gap.
-	s.sendMu.Lock()
-	if c := s.crypto.Load(); c != nil {
-		buf, err = c.encrypt(buf)
-		if err != nil {
-			s.sendMu.Unlock()
-			return err
-		}
-	}
+	msg := outMsg{buf: buf, encrypt: s.crypto.Load() != nil}
+
 	// Enqueue for the writer goroutine. Blocks (applying backpressure)
 	// when the carrier is saturated; unblocks with ErrClosed on Close.
+	// No mutex is held here, so a full queue never serializes waiters
+	// behind a peer's deadline.
 	var timeout <-chan time.Time
 	if !deadline.IsZero() {
 		timeout = time.After(time.Until(deadline))
 	}
 	select {
-	case s.sendQueue <- buf:
-		s.sendMu.Unlock()
+	case s.sendQueue <- msg:
 		return nil
 	case <-s.closed:
-		s.sendMu.Unlock()
 		return ErrClosed
 	case <-timeout:
-		s.sendMu.Unlock()
 		return os.ErrDeadlineExceeded
 	}
 }

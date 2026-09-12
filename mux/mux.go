@@ -412,8 +412,10 @@ type Stream struct {
 	recvUnacked  int
 	peerNotified bool // we sent Close
 
-	recvNotify chan struct{} // cap 1
-	sendNotify chan struct{} // cap 1
+	// Broadcast notify channels (wake ALL waiters, net.Conn allows
+	// concurrent I/O from multiple goroutines).
+	recvNotify broadcast
+	sendNotify broadcast
 	closedCh   chan struct{}
 	closeOnce  sync.Once
 	// Deadline broadcast: generation channels wake ALL pending waiters
@@ -454,6 +456,9 @@ func (b *broadcast) Wait() (<-chan struct{}, time.Time) {
 	return b.ch, b.t
 }
 
+// Ping wakes all current waiters (no value attached).
+func (b *broadcast) Ping() { b.Set(time.Now()) }
+
 func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 	return &Stream{
 		id:            id,
@@ -462,8 +467,8 @@ func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 		destPort:      destPort,
 		openCh:        make(chan error, 1),
 		sendWindow:    DefaultWindowSize,
-		recvNotify:    make(chan struct{}, 1),
-		sendNotify:    make(chan struct{}, 1),
+		recvNotify:    newBroadcast(),
+		sendNotify:    newBroadcast(),
 		closedCh:      make(chan struct{}),
 		readDeadline:  newBroadcast(),
 		writeDeadline: newBroadcast(),
@@ -535,7 +540,7 @@ func (s *Stream) feedData(payload []byte) {
 	}
 	s.recvBuf.Write(append([]byte(nil), payload...))
 	s.mu.Unlock()
-	notify(s.recvNotify)
+	s.recvNotify.Ping()
 }
 
 func (s *Stream) addSendWindow(n uint32) {
@@ -548,14 +553,14 @@ func (s *Stream) addSendWindow(n uint32) {
 	}
 	s.sendWindow = int(credit)
 	s.mu.Unlock()
-	notify(s.sendNotify)
+	s.sendNotify.Ping()
 }
 
 func (s *Stream) remoteHalfClose() {
 	s.mu.Lock()
 	s.readEOF = true
 	s.mu.Unlock()
-	notify(s.recvNotify)
+	s.recvNotify.Ping()
 }
 
 func (s *Stream) remoteClose() {
@@ -565,8 +570,8 @@ func (s *Stream) remoteClose() {
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
-	notify(s.recvNotify)
-	notify(s.sendNotify)
+	s.recvNotify.Ping()
+	s.sendNotify.Ping()
 }
 
 func (s *Stream) closeNoSend() {
@@ -576,8 +581,8 @@ func (s *Stream) closeNoSend() {
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
-	notify(s.recvNotify)
-	notify(s.sendNotify)
+	s.recvNotify.Ping()
+	s.sendNotify.Ping()
 }
 
 // releaseBufferLocked returns the remaining unread buffer's share of the
@@ -593,19 +598,15 @@ func (s *Stream) releaseBufferLocked() {
 	}
 }
 
-func notify(ch chan struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
-}
-
 func (s *Stream) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
 	for {
 		s.mu.Lock()
+		// Subscribe while holding the lock: any state change after we
+		// unlock is guaranteed to ping our channel.
+		nch, _ := s.recvNotify.Wait()
 		if s.recvBuf.Len() > 0 {
 			n, _ := s.recvBuf.Read(b)
 			if s.bufferReleased {
@@ -648,7 +649,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 			return 0, errTimeout
 		}
 		select {
-		case <-s.recvNotify:
+		case <-nch:
 		case <-s.closedCh:
 		case <-dlCh: // deadline changed: recompute
 		case <-dch:
@@ -667,6 +668,9 @@ func (s *Stream) Write(b []byte) (int, error) {
 	for total < len(b) {
 		s.mu.Lock()
 		for s.sendWindow == 0 && !s.closed && !s.writeClosed {
+			// Subscribe while still holding the lock: any state change
+			// after we unlock is guaranteed to ping our channel.
+			nch, _ := s.sendNotify.Wait()
 			s.mu.Unlock()
 			dlCh, deadline := s.writeDeadline.Wait()
 			dch, expired := deadlineChan(deadline)
@@ -674,7 +678,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 				return total, errTimeout
 			}
 			select {
-			case <-s.sendNotify:
+			case <-nch:
 			case <-s.closedCh:
 			case <-dlCh: // deadline changed: recompute
 			case <-dch:
@@ -709,7 +713,7 @@ func (s *Stream) Write(b []byte) (int, error) {
 			s.mu.Lock()
 			s.sendWindow += n
 			s.mu.Unlock()
-			notify(s.sendNotify)
+			s.sendNotify.Ping()
 			return total, err
 		}
 		total += n
@@ -728,7 +732,7 @@ func (s *Stream) CloseWrite() error {
 	s.writeClosed = true
 	s.mu.Unlock()
 	// Wake any writer blocked on an exhausted window.
-	notify(s.sendNotify)
+	s.sendNotify.Ping()
 	return s.m.send(wire.Frame{Type: wire.TypeHalfClose, StreamID: s.id})
 }
 
