@@ -28,6 +28,8 @@ type Transport interface {
 	Send(data []byte) error
 	Receive(callback func([]byte))
 	IsConnected() bool
+	// IsRunning reports whether Start was called and Stop has not.
+	IsRunning() bool
 	Stats() TransportStats
 }
 

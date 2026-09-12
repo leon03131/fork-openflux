@@ -110,6 +110,11 @@ func (t *OneMeTransport) IsConnected() bool {
 	return t.b.IsConnected()
 }
 
+// IsRunning reports whether the transport was started and not stopped.
+func (t *OneMeTransport) IsRunning() bool {
+	return t.b.IsRunning()
+}
+
 // Bounce drops the current call signaling connection; the caller loop
 // reconnects. Implements transport.Bouncer.
 func (t *OneMeTransport) Bounce() {

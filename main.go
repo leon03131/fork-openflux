@@ -29,6 +29,7 @@ import (
 	"github.com/leon03131/fork-openflux/transport/mail"
 	"github.com/leon03131/fork-openflux/transport/oneme"
 	"github.com/leon03131/fork-openflux/transport/onlyoffice"
+	"github.com/leon03131/fork-openflux/transport/reliable"
 	"github.com/leon03131/fork-openflux/transport/volga"
 	"github.com/leon03131/fork-openflux/transport/ydetect"
 	"github.com/leon03131/fork-openflux/tunnel"
@@ -309,6 +310,16 @@ func (d *atomicDialer) DialTCP(address string) (net.Conn, error) {
 	return m.DialTCP(address)
 }
 
+// isDocCarrier reports whether the transport is a document-based carrier
+// (lossy cursor state-sync by provider design).
+func isDocCarrier(name string) bool {
+	switch name {
+	case "onlyoffice", "mail", "volga", "yandex":
+		return true
+	}
+	return false
+}
+
 // runV2 runs the stream-mux protocol: SOCKS5 -> mux -> session -> carrier,
 // and symmetrically on the exit side. No root/raw sockets required.
 //
@@ -316,6 +327,24 @@ func (d *atomicDialer) DialTCP(address string) (net.Conn, error) {
 // existing streams die with the old session (they cannot survive a
 // carrier reconnect), new connections use the fresh session.
 func runV2(ctx context.Context, trans transport.Transport, cfg *cliConfig) error {
+	// Document carriers (onlyoffice/mail/volga) are lossy by provider
+	// nature (cursor state-sync): wrap them in the reliable adapter so
+	// the session sees a strictly reliable+ordered channel. Direct
+	// stays raw (TCP is already reliable).
+	rawTrans := trans
+	defer rawTrans.Stop() // runs after the adapter's Stop (LIFO)
+	if isDocCarrier(cfg.transportType) {
+		maxP := 64 * 1024
+		if pc, ok := trans.(interface{ MaxPayload() int }); ok && pc.MaxPayload() > 64 {
+			maxP = pc.MaxPayload() - 64
+		}
+		trans = reliable.New(ctx, trans, reliable.Config{
+			MaxUnackedFrames:   256,
+			MaxUnackedBytes:    maxP,
+			RetransmitInterval: 500 * time.Millisecond,
+		})
+		log.Printf("reliable adapter enabled (window %d KB)", maxP/1024)
+	}
 	if err := trans.Start(); err != nil {
 		return fmt.Errorf("failed to start transport: %w", err)
 	}

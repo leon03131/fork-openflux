@@ -30,6 +30,17 @@ const (
 	// propagates backpressure to the local reader.
 	DefaultWindowSize = 512 * 1024
 
+	// windowUpdateThreshold is the coalescing threshold for
+	// WINDOW_UPDATE: Read accumulates credit and flushes it once this
+	// many bytes are pending, instead of sending one update per Read.
+	windowUpdateThreshold = 64 * 1024
+
+	// windowUpdateInterval bounds how long sub-threshold credit may
+	// sit unsent: a per-stream timer flushes pending credit this long
+	// after the last update, so the sender can never starve waiting
+	// for credit the receiver has already consumed.
+	windowUpdateInterval = 50 * time.Millisecond
+
 	// OpenTimeout bounds the OPEN -> OPEN_OK/OPEN_ERROR handshake.
 	// It is deliberately larger than the exit's dial timeout (10s) so
 	// the exit can always answer OPEN_ERROR before we give up.
@@ -445,9 +456,23 @@ type Stream struct {
 	closed      bool
 	writeClosed bool
 	sendWindow  int
-	// pendingCredit is WINDOW_UPDATE credit we owe the peer because a
-	// previous WINDOW_UPDATE frame failed to send.
+	// pendingCredit is consumed receive bytes not yet granted back to
+	// the peer: Reads accumulate it, and it is flushed as a
+	// WINDOW_UPDATE once it reaches windowUpdateThreshold, or when
+	// windowUpdateInterval has passed since the last flush (wuTimer).
+	// With a 512 KiB window and a 64 KiB threshold the window is
+	// replenished after at most 1/8 of it was read, so coalescing
+	// cannot starve a bulk sender; the timer covers the tail.
 	pendingCredit int
+	// lastUpdate is when the last WINDOW_UPDATE was flushed. Stream
+	// creation counts as a "flush": the peer starts with a full
+	// window, so no credit is owed.
+	lastUpdate time.Time
+	// wuTimer is the single coalescing timer per stream (created
+	// lazily, reused via Reset); wuArmed reports whether it is
+	// scheduled to fire. Stopped on terminal close: no timer leak.
+	wuTimer *time.Timer
+	wuArmed bool
 	// recvUnacked bounds unread buffered data so a misbehaving peer
 	// cannot grow recvBuf without limit.
 	recvUnacked  int
@@ -508,6 +533,7 @@ func newStream(m *Mux, id uint32, destHost string, destPort uint16) *Stream {
 		destPort:      destPort,
 		openCh:        make(chan error, 1),
 		sendWindow:    DefaultWindowSize,
+		lastUpdate:    time.Now(),
 		recvNotify:    newBroadcast(),
 		sendNotify:    newBroadcast(),
 		closedCh:      make(chan struct{}),
@@ -622,6 +648,7 @@ func (s *Stream) remoteClose() {
 	if !s.readEOF {
 		s.setResetLocked(ErrPeerClosed)
 	}
+	s.stopCreditTimerLocked()
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -633,6 +660,7 @@ func (s *Stream) closeNoSend() {
 	s.mu.Lock()
 	s.closed = true
 	s.setResetLocked(s.m.resetReason())
+	s.stopCreditTimerLocked()
 	s.releaseBufferLocked()
 	s.mu.Unlock()
 	s.closeOnce.Do(func() { close(s.closedCh) })
@@ -672,15 +700,20 @@ func (s *Stream) Read(b []byte) (int, error) {
 			}
 			s.recvUnacked -= n
 			s.m.buffered.Add(-int64(n))
-			credit := n + s.pendingCredit
-			s.pendingCredit = 0
+			// Accumulate the consumed bytes; flush coalesced. A bulk
+			// reader hits the threshold every windowUpdateThreshold
+			// bytes; a trickle reader is covered by the timer, so
+			// credit is always returned within windowUpdateInterval.
+			s.pendingCredit += n
+			var credit int
+			if s.pendingCredit >= windowUpdateThreshold {
+				credit = s.takeCreditLocked()
+			} else {
+				s.armCreditTimerLocked()
+			}
 			s.mu.Unlock()
-			// Grant the consumed bytes back to the peer. If the update
-			// fails to send, remember the credit instead of losing it.
-			if err := s.m.send(wire.Frame{Type: wire.TypeWindowUpdate, StreamID: s.id, Payload: uint32Bytes(uint32(credit))}); err != nil {
-				s.mu.Lock()
-				s.pendingCredit += credit
-				s.mu.Unlock()
+			if credit > 0 {
+				s.sendWindowUpdate(credit)
 			}
 			return n, nil
 		}
@@ -713,6 +746,75 @@ func (s *Stream) Read(b []byte) (int, error) {
 			return 0, errTimeout
 		}
 	}
+}
+
+// takeCreditLocked extracts all pending credit for an immediate
+// WINDOW_UPDATE flush; the caller sends it WITHOUT holding s.mu (the
+// session queue wait must not block the stream lock).
+func (s *Stream) takeCreditLocked() int {
+	credit := s.pendingCredit
+	s.pendingCredit = 0
+	s.lastUpdate = time.Now()
+	s.stopCreditTimerLocked()
+	return credit
+}
+
+// armCreditTimerLocked schedules the coalescing timer to flush pending
+// credit windowUpdateInterval after the last update. No-op when already
+// armed or when the stream is closed. Caller must hold s.mu.
+func (s *Stream) armCreditTimerLocked() {
+	if s.wuArmed || s.closed {
+		return
+	}
+	d := time.Until(s.lastUpdate.Add(windowUpdateInterval))
+	if d < 0 {
+		d = 0
+	}
+	if s.wuTimer == nil {
+		s.wuTimer = time.AfterFunc(d, s.creditTimerFired)
+	} else {
+		s.wuTimer.Reset(d)
+	}
+	s.wuArmed = true
+}
+
+// stopCreditTimerLocked disarms the coalescing timer. Caller must hold
+// s.mu. A callback already in flight is guarded by the closed/pending
+// checks in creditTimerFired.
+func (s *Stream) stopCreditTimerLocked() {
+	if s.wuArmed {
+		s.wuTimer.Stop()
+		s.wuArmed = false
+	}
+}
+
+// creditTimerFired flushes pending credit after windowUpdateInterval of
+// quiet: covers the sub-threshold tail so a slow reader cannot starve
+// the sender.
+func (s *Stream) creditTimerFired() {
+	s.mu.Lock()
+	s.wuArmed = false
+	if s.closed || s.pendingCredit == 0 {
+		s.mu.Unlock()
+		return
+	}
+	credit := s.takeCreditLocked()
+	s.mu.Unlock()
+	s.sendWindowUpdate(credit)
+}
+
+// sendWindowUpdate grants credit back to the peer. If the frame fails
+// to send, the credit is re-queued (and the timer re-armed) instead of
+// being lost.
+func (s *Stream) sendWindowUpdate(credit int) {
+	err := s.m.send(wire.Frame{Type: wire.TypeWindowUpdate, StreamID: s.id, Payload: uint32Bytes(uint32(credit))})
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.pendingCredit += credit
+	s.armCreditTimerLocked()
+	s.mu.Unlock()
 }
 
 func (s *Stream) Write(b []byte) (int, error) {

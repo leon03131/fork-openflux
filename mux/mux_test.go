@@ -7,11 +7,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/leon03131/fork-openflux/session"
 	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/wire"
 )
 
 // newMuxPair builds a client/server mux pair over in-process sessions.
@@ -654,6 +656,112 @@ func TestSessionDeathPropagatesReason(t *testing.T) {
 	}
 	if errors.Is(err, ErrStreamClosed) || errors.Is(err, io.EOF) {
 		t.Fatalf("Read returned a generic error instead of the cause: %v", err)
+	}
+}
+
+// TestWindowUpdateCoalescing pushes 4 MiB through an echo stream and
+// counts WINDOW_UPDATE frames received by each session (counting
+// wrappers around the mux frame handlers). Coalescing must keep WU
+// frames far below the number of Read calls — the pre-coalescing
+// behavior sent exactly one WU per Read.
+func TestWindowUpdateCoalescing(t *testing.T) {
+	cm, sm, csess, ssess := newMuxPairSessions(t, nil)
+
+	// Count WINDOW_UPDATE frames flowing in each direction. No streams
+	// exist yet, so re-registering the handlers loses nothing.
+	var wuToClient, wuToServer atomic.Int64
+	csess.OnFrame(func(f wire.Frame) {
+		if f.Type == wire.TypeWindowUpdate {
+			wuToClient.Add(1)
+		}
+		cm.handleFrame(f)
+	})
+	ssess.OnFrame(func(f wire.Frame) {
+		if f.Type == wire.TypeWindowUpdate {
+			wuToServer.Add(1)
+		}
+		sm.handleFrame(f)
+	})
+
+	// Echo server with a small read buffer: Read count is measurable
+	// and comparable to the client's.
+	var serverReads atomic.Int64
+	go func() {
+		st, err := sm.Accept()
+		if err != nil {
+			return
+		}
+		if err := st.AcceptOpen(); err != nil {
+			return
+		}
+		buf := make([]byte, 8192)
+		for {
+			n, err := st.Read(buf)
+			if n > 0 {
+				serverReads.Add(1)
+				if _, werr := st.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	st, err := cm.Open("example.com", 80)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	const total = 4 << 20 // 4 MiB
+	data := make([]byte, total)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := st.Write(data)
+		writeDone <- err
+	}()
+
+	var clientReads int64
+	received := 0
+	buf := make([]byte, 8192)
+	st.SetReadDeadline(time.Now().Add(60 * time.Second))
+	for received < total {
+		n, err := st.Read(buf)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if !bytes.Equal(buf[:n], data[received:received+n]) {
+			t.Fatal("echo data mismatch")
+		}
+		received += n
+		clientReads++
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Let in-flight frames and the final timer-driven flush land.
+	time.Sleep(300 * time.Millisecond)
+
+	wu := wuToClient.Load() + wuToServer.Load()
+	reads := clientReads + serverReads.Load()
+	// Threshold-driven minimum is ~2*(4MiB/64KiB) = 128 WU total; the
+	// old code would have sent exactly `reads`.
+	t.Logf("4 MiB echo: %d reads, %d WINDOW_UPDATE frames (pre-coalescing: %d)", reads, wu, reads)
+	if wu == 0 {
+		t.Fatal("no WINDOW_UPDATE frames observed")
+	}
+	if wu*4 > reads {
+		t.Fatalf("WINDOW_UPDATE not coalesced: %d WU for %d reads", wu, reads)
+	}
+	// Absolute bound with generous slack for timer flushes on stalls.
+	if wu > 512 {
+		t.Fatalf("too many WINDOW_UPDATE frames: %d", wu)
 	}
 }
 
