@@ -226,13 +226,15 @@ func TestReliableUnderCorruption(t *testing.T) {
 // craftMessageV2 builds a raw OFR2 adapter wire message for injection
 // tests. macKey=nil builds a MAC-less message (matching Configs without
 // a MacKey).
-func craftMessageV2(channelID [channelIDSize]byte, macKey []byte, epoch [epochSize]byte, ackThrough, seq uint64, payload []byte) []byte {
+func craftMessageV2(channelID [channelIDSize]byte, macKey []byte, epoch [epochSize]byte, ackThrough, ackBits, seq uint64, payload []byte) []byte {
 	buf := make([]byte, 0, headerSize+frameHeader+len(payload)+macSize+crcSize)
 	buf = append(buf, "OFR2"...)
 	buf = append(buf, channelID[:]...)
 	buf = append(buf, epoch[:]...)
 	var tmp [8]byte
 	binary.BigEndian.PutUint64(tmp[:], ackThrough)
+	buf = append(buf, tmp[:]...)
+	binary.BigEndian.PutUint64(tmp[:], ackBits)
 	buf = append(buf, tmp[:]...)
 	buf = append(buf, 0, 1) // count=1
 	binary.BigEndian.PutUint64(tmp[:], seq)
@@ -248,6 +250,50 @@ func craftMessageV2(channelID [channelIDSize]byte, macKey []byte, epoch [epochSi
 	binary.BigEndian.PutUint32(cb[:], crc32.ChecksumIEEE(buf))
 	buf = append(buf, cb[:]...)
 	return buf
+}
+
+// craftAckV2 builds a raw pure-ack (count=0) OFR2 message with the given
+// cumulative ackThrough and SACK bitmap — for driving the sender's ack
+// processing deterministically in dup-ack/threshold tests.
+func craftAckV2(channelID [channelIDSize]byte, epoch [epochSize]byte, ackThrough, ackBits uint64) []byte {
+	buf := make([]byte, 0, headerSize+crcSize)
+	buf = append(buf, "OFR2"...)
+	buf = append(buf, channelID[:]...)
+	buf = append(buf, epoch[:]...)
+	var tmp [8]byte
+	binary.BigEndian.PutUint64(tmp[:], ackThrough)
+	buf = append(buf, tmp[:]...)
+	binary.BigEndian.PutUint64(tmp[:], ackBits)
+	buf = append(buf, tmp[:]...)
+	buf = append(buf, 0, 0) // count=0
+	var cb [4]byte
+	binary.BigEndian.PutUint32(cb[:], crc32.ChecksumIEEE(buf))
+	buf = append(buf, cb[:]...)
+	return buf
+}
+
+// parseSeqs extracts the frame seqs of a raw OFR2 wire message
+// (bounds-checked; ok=false if it is not a well-formed frame list).
+func parseSeqs(data []byte) (seqs []uint64, ok bool) {
+	if len(data) < headerSize+crcSize || string(data[:magicSize]) != "OFR2" {
+		return nil, false
+	}
+	count := int(binary.BigEndian.Uint16(data[headerSize-2 : headerSize]))
+	off := headerSize
+	for i := 0; i < count; i++ {
+		if off+frameHeader > len(data) {
+			return nil, false
+		}
+		seq := binary.BigEndian.Uint64(data[off:])
+		ln := binary.BigEndian.Uint32(data[off+8:])
+		off += frameHeader
+		if uint64(ln) > uint64(len(data)-off) {
+			return nil, false
+		}
+		seqs = append(seqs, seq)
+		off += int(ln)
+	}
+	return seqs, true
 }
 
 // waitDropped polls until r's drop counter reaches want.
@@ -350,7 +396,7 @@ func TestReliableReconnect(t *testing.T) {
 
 	// Inject a perfectly well-formed message from the OLD generation:
 	// huge ackThrough and a seq=1 frame — all of it must be ignored.
-	stale := craftMessageV2([channelIDSize]byte{}, nil, oldEpoch, 1_000_000, 1, []byte("STALE-GENERATION"))
+	stale := craftMessageV2([channelIDSize]byte{}, nil, oldEpoch, 1_000_000, 0, 1, []byte("STALE-GENERATION"))
 	dropsBefore := rb2.Dropped()
 	if err := p.fa.Send(stale); err != nil {
 		t.Fatal(err)
@@ -464,7 +510,7 @@ func TestNewGeneration(t *testing.T) {
 	p.fb.SetDrop(0)
 	time.Sleep(100 * time.Millisecond)
 	drops := p.ra.Dropped()
-	if err := p.fb.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochB, 999, 1, []byte("STALE-B"))); err != nil {
+	if err := p.fb.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochB, 999, 0, 1, []byte("STALE-B"))); err != nil {
 		t.Fatal(err)
 	}
 	waitDropped(t, p.ra, drops+1)
@@ -500,7 +546,7 @@ func TestNewGeneration(t *testing.T) {
 
 	// Old-generation injections are still dropped after the re-latch.
 	drops = p.rb.Dropped()
-	if err := p.fa.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochA, 999999, 1, []byte("STALE-A"))); err != nil {
+	if err := p.fa.Send(craftMessageV2([channelIDSize]byte{}, nil, oldEpochA, 999999, 0, 1, []byte("STALE-A"))); err != nil {
 		t.Fatal(err)
 	}
 	waitDropped(t, p.rb, drops+1)
@@ -536,7 +582,7 @@ func TestChannelIsolation(t *testing.T) {
 	nd, peerEp := p.rb.nextDeliver, p.rb.peerEpoch
 	p.rb.mu.Unlock()
 	foreignCh := [channelIDSize]byte{0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4}
-	poison := craftMessageV2(foreignCh, nil, peerEp, 0, nd, []byte("POISON-PAYLOAD"))
+	poison := craftMessageV2(foreignCh, nil, peerEp, 0, 0, nd, []byte("POISON-PAYLOAD"))
 	drops := p.rb.Dropped()
 	if err := p.fa.Send(poison); err != nil {
 		t.Fatal(err)
@@ -593,12 +639,12 @@ func TestMACProtection(t *testing.T) {
 	// (a) Right channel, MAC computed with the WRONG key: CRC is valid,
 	//     MAC is not — silent drop before content inspection.
 	wrongKey := DeriveMACKey([]byte("attacker-psk"))
-	if err := fa.Send(craftMessageV2(cfg.ChannelID, wrongKey[:], [epochSize]byte{1}, 0, 1, []byte("forged"))); err != nil {
+	if err := fa.Send(craftMessageV2(cfg.ChannelID, wrongKey[:], [epochSize]byte{1}, 0, 0, 1, []byte("forged"))); err != nil {
 		t.Fatal(err)
 	}
 	// (b) Right channel and key, but a MAC byte flipped (CRC re-fixed):
 	//     proves the MAC is really verified, not just the CRC.
-	tampered := craftMessageV2(cfg.ChannelID, cfg.MacKey[:], [epochSize]byte{2}, 0, 1, []byte("x"))
+	tampered := craftMessageV2(cfg.ChannelID, cfg.MacKey[:], [epochSize]byte{2}, 0, 0, 1, []byte("x"))
 	macStart := len(tampered) - crcSize - macSize
 	tampered[macStart] ^= 0xFF
 	binary.BigEndian.PutUint32(tampered[len(tampered)-crcSize:], crc32.ChecksumIEEE(tampered[:len(tampered)-crcSize]))
@@ -606,7 +652,7 @@ func TestMACProtection(t *testing.T) {
 		t.Fatal(err)
 	}
 	// (c) MAC-less message on a MAC-enabled link: too short / fails MAC.
-	if err := fa.Send(craftMessageV2(cfg.ChannelID, nil, [epochSize]byte{3}, 0, 1, []byte("no-mac"))); err != nil {
+	if err := fa.Send(craftMessageV2(cfg.ChannelID, nil, [epochSize]byte{3}, 0, 0, 1, []byte("no-mac"))); err != nil {
 		t.Fatal(err)
 	}
 	waitDropped(t, rb, drops+3)
@@ -723,7 +769,7 @@ func TestDoubleRotationDenyHistory(t *testing.T) {
 
 	// Inject a frame from B's OLD epoch INTO A (fb sends → fa receives):
 	// must be dropped (deny history covers it), and A must not latch it.
-	stale := craftMessageV2([channelIDSize]byte{}, nil, epochB0, 0, 1, []byte("stale"))
+	stale := craftMessageV2([channelIDSize]byte{}, nil, epochB0, 0, 0, 1, []byte("stale"))
 	p.fb.Send(stale) // B's carrier → A
 
 	p.ra.mu.Lock()
@@ -884,7 +930,7 @@ func TestReliableBackpressure(t *testing.T) {
 
 		// Wire accounting: each frame costs frameHeader+payload, and the
 		// byte budget is min(MaxUnackedBytes, what fits one snapshot on
-		// the 256 KiB faulty carrier) = 262144 - (38+16+4) = 262,086.
+		// the 256 KiB faulty carrier) = 262144 - (46+16+4) = 262,078.
 		const payloadSize = 100 * 1024
 		budget := 256*1024 - (headerSize + macSize + crcSize)
 		if DefaultMaxUnackedBytes < budget {
@@ -1098,6 +1144,7 @@ func TestBuildParseRoundtrip(t *testing.T) {
 	}
 	r.unackedBytes = 5 + 0 + 1000
 	r.nextDeliver = 77
+	r.pending = map[uint64][]byte{78: []byte("a"), 80: []byte("b")} // SACK bits 1 and 3
 	snap := r.buildSnapshotLocked()
 	r.mu.Unlock()
 
@@ -1110,6 +1157,9 @@ func TestBuildParseRoundtrip(t *testing.T) {
 	}
 	if m.ackThrough != 76 {
 		t.Errorf("ackThrough=%d, want 76", m.ackThrough)
+	}
+	if m.ackBits != (1<<1)|(1<<3) {
+		t.Errorf("ackBits=%#x, want %#x (pending 78,80 past ackThrough 76)", m.ackBits, (1<<1)|(1<<3))
 	}
 	if len(m.frames) != 3 {
 		t.Fatalf("frames=%d, want 3", len(m.frames))
@@ -1294,6 +1344,289 @@ func TestThroughputRegression(t *testing.T) {
 	t.Logf("10 MiB through the pair in %v (%.1f MiB/s)", d, 10/d.Seconds())
 	if d > 30*time.Second {
 		t.Fatalf("10 MiB took %v, want < 30s", d)
+	}
+}
+
+// sackDropper wraps a FaultyTransport and drops the FIRST outbound
+// carrier message carrying each target frame seq (a single-loss model);
+// later retransmissions of those seqs pass. It also counts retransmitted
+// frames: any frame whose seq goes on the wire more than once.
+type sackDropper struct {
+	*transport.FaultyTransport
+	mu         sync.Mutex
+	dropSeqs   map[uint64]bool
+	dropped    map[uint64]bool
+	sent       map[uint64]int
+	retxFrames int
+}
+
+func newSackDropper(f *transport.FaultyTransport, seqs ...uint64) *sackDropper {
+	s := &sackDropper{
+		FaultyTransport: f,
+		dropSeqs:        make(map[uint64]bool),
+		dropped:         make(map[uint64]bool),
+		sent:            make(map[uint64]int),
+	}
+	for _, sq := range seqs {
+		s.dropSeqs[sq] = true
+	}
+	return s
+}
+
+func (s *sackDropper) Send(data []byte) error {
+	if seqs, ok := parseSeqs(data); ok {
+		s.mu.Lock()
+		drop := false
+		for _, seq := range seqs {
+			s.sent[seq]++
+			if s.sent[seq] > 1 {
+				s.retxFrames++
+			}
+			if s.dropSeqs[seq] && !s.dropped[seq] {
+				s.dropped[seq] = true
+				drop = true // first transmission of a target frame: lost on the wire
+			}
+		}
+		s.mu.Unlock()
+		if drop {
+			return nil
+		}
+	}
+	return s.FaultyTransport.Send(data)
+}
+
+// RetxFrames reports how many retransmitted frames went on the wire.
+func (s *sackDropper) RetxFrames() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retxFrames
+}
+
+// TestSACKMultipleLosses: 3 holes (frames 5, 12, 18 of 30 lost once) are
+// all repaired FAST by the SACK-driven fast retransmit — not one hole
+// per RTO — and the retransmit count stays minimal (≈3 frames, one per
+// hole; never the whole window). RTO is set to 10 s so any RTO-based
+// recovery is caught by the 5 s wall-clock bound.
+func TestSACKMultipleLosses(t *testing.T) {
+	fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+	if err := fa.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fa.Stop(); fb.Stop() })
+
+	sd := newSackDropper(fa, 5, 12, 18)
+	cfg := testConfig()
+	cfg.RetransmitInterval = 10 * time.Second // RTO must NOT be the recovery path
+	ra := New(context.Background(), sd, cfg)
+	rb := New(context.Background(), fb, cfg)
+	if err := ra.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ra.Stop(); rb.Stop() })
+
+	const total, size = 30, 256
+	c := collect(rb, total)
+	start := time.Now()
+	for i := 0; i < total; i++ { // seq = i+1; drops hit i = 4, 11, 17
+		if err := ra.Send(makeMsg(i, size)); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	expectMessages(t, c, 0, total, size)
+	d := time.Since(start)
+	if d > 5*time.Second {
+		t.Fatalf("recovery took %v — holes repaired by RTO, not by SACK fast retransmit", d)
+	}
+	waitDrained(t, ra)
+	n := sd.RetxFrames()
+	t.Logf("3 holes recovered in %v with %d retransmitted frames (retransmitsTotal=%d)",
+		d, n, ra.Retransmits())
+	if n < 3 || n > 8 {
+		t.Fatalf("retransmitted frames=%d, want ≈3 (one per hole; SACK must avoid window floods)", n)
+	}
+	expectNoExtra(t, c)
+}
+
+// seqRecorder wraps a FaultyTransport and counts how many wire messages
+// carried each frame seq (retransmit observation for threshold tests).
+type seqRecorder struct {
+	*transport.FaultyTransport
+	mu     sync.Mutex
+	counts map[uint64]int
+}
+
+func (s *seqRecorder) Send(data []byte) error {
+	if seqs, ok := parseSeqs(data); ok {
+		s.mu.Lock()
+		for _, sq := range seqs {
+			s.counts[sq]++
+		}
+		s.mu.Unlock()
+	}
+	return s.FaultyTransport.Send(data)
+}
+
+func (s *seqRecorder) count(seq uint64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[seq]
+}
+
+// TestFastRetransmitThreshold: 1-2 consecutive dup-acks must NOT trigger
+// a retransmit (reorder-safe, RFC 9002); the 3rd must. Phase 1 drives
+// SACK bitmaps with growing coverage (the loss is provable only at the
+// 3rd dup-ack); phase 2 drives pure dup-acks with an empty bitmap, where
+// the dupStreak counter is the only trigger and the gap head is re-sent.
+// RetransmitInterval is huge so the RTO path can never fire here — every
+// observed retransmit is a fast retransmit.
+func TestFastRetransmitThreshold(t *testing.T) {
+	fa, fb := transport.NewFaultyPair(transport.DefaultConfig())
+	if err := fa.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fb.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fa.Stop(); fb.Stop() })
+
+	rec := &seqRecorder{FaultyTransport: fa, counts: make(map[uint64]int)}
+	cfg := testConfig()
+	cfg.RetransmitInterval = 10 * time.Second
+	ra := New(context.Background(), rec, cfg)
+	if err := ra.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ra.Stop() })
+
+	// Latch a peer epoch so crafted acks are accepted.
+	peerEpoch := [epochSize]byte{0xBE, 1, 2, 3}
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ra.mu.Lock()
+		latched := ra.peerEpochSet
+		ra.mu.Unlock()
+		if latched {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("peer epoch never latched")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 9 frames outstanding (seqs 1..9), hole at 6 (peer never got it).
+	for i := 1; i <= 9; i++ {
+		if err := ra.Send(makeMsg(i, 128)); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+
+	const (
+		settle  = 200 * time.Millisecond
+		pollMax = 5 * time.Second
+	)
+	// sackBits returns the bitmap for the given ackThrough with the
+	// listed seqs marked received (bit i = seq ackThrough+1+i).
+	sackBits := func(ackThrough uint64, seqs ...uint64) uint64 {
+		var b uint64
+		for _, s := range seqs {
+			b |= 1 << (s - ackThrough - 1)
+		}
+		return b
+	}
+
+	// Setup: cumulative ack through 5 (progress; frees seqs 1..5). The
+	// bitmap shows only seq 7 — one later seq past the hole at 6, NOT
+	// enough to prove the loss — so no retransmit may happen.
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 5, sackBits(5, 7))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(settle)
+	if n := rec.count(6); n != 1 {
+		t.Fatalf("after progress ack: seq 6 sent %d times, want 1 (no retransmit)", n)
+	}
+
+	// Phase 1: dup-acks 1 and 2 — fewer than 3 later seqs sacked above
+	// the hole and the dup streak below threshold — NO retransmit.
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 5, sackBits(5, 7, 8))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(settle)
+	if n := rec.count(6); n != 1 {
+		t.Fatalf("after dup-ack 1: seq 6 sent %d times, want 1 (no retransmit)", n)
+	}
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 5, sackBits(5, 7, 8))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(settle)
+	if n := rec.count(6); n != 1 {
+		t.Fatalf("after dup-ack 2: seq 6 sent %d times, want 1 (no retransmit)", n)
+	}
+
+	// Dup-ack 3: the bitmap now proves the hole (3 later seqs sacked)
+	// AND the dup streak hits the threshold — frame 6 is re-sent,
+	// exactly once; the sacked frames 7-9 are NOT re-sent.
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 5, sackBits(5, 7, 8, 9))); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(pollMax)
+	for rec.count(6) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("after dup-ack 3: seq 6 sent %d times, want 2 (fast retransmit)", rec.count(6))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(settle)
+	if n := rec.count(6); n != 2 {
+		t.Fatalf("seq 6 sent %d times, want exactly 2 (selective retransmit)", n)
+	}
+	for _, sq := range []uint64{5, 7, 8, 9} {
+		if n := rec.count(sq); n != 1 {
+			t.Fatalf("seq %d sent %d times, want 1 — sacked/acked frames must not be re-sent", sq, n)
+		}
+	}
+
+	// Phase 2: pure dup-acks with an EMPTY bitmap. Move ackThrough to 6
+	// (progress, streak reset; peer reports 8,9 sacked), then drive acks
+	// that carry no SACK info: 1-2 dups do nothing, the 3rd re-sends
+	// the gap head (seq 7) via the dupStreak fallback.
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 6, sackBits(6, 8, 9))); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(settle) // progress ack frees seq 6; 7 not provably lost
+	if n := rec.count(7); n != 1 {
+		t.Fatalf("after progress ack: seq 7 sent %d times, want 1", n)
+	}
+	for dup := 1; dup <= 2; dup++ {
+		if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 6, 0)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(settle)
+		if n := rec.count(7); n != 1 {
+			t.Fatalf("after pure dup-ack %d: seq 7 sent %d times, want 1 (no retransmit)", dup, n)
+		}
+	}
+	if err := fb.Send(craftAckV2([channelIDSize]byte{}, peerEpoch, 6, 0)); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(pollMax)
+	for rec.count(7) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("after pure dup-ack 3: seq 7 sent %d times, want 2 (gap-head fallback)", rec.count(7))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := rec.count(8); n != 1 {
+		t.Fatalf("seq 8 sent %d times, want 1 (only the gap head is re-sent)", n)
 	}
 }
 

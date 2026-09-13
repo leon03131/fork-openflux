@@ -10,13 +10,19 @@
 // (ackThrough) covers them; acked frames are never re-sent.
 // Retransmission happens only on:
 //
-//   - fast retransmit: an incoming ack repeats the previous ackThrough
-//     while frames are outstanding — the peer only acks after receiving
-//     data, so a repeated ackThrough means it saw something newer but is
-//     stuck on a gap (dup-ack, TCP-style). After fastRetxThreshold
-//     consecutive dup-acks the gap head (oldest unacked frame) is
-//     re-sent, re-arming every fastRetxEvery further dup-acks while the
-//     hole persists;
+//   - fast retransmit, SELECTIVE (SACK): every ack carries a 64-bit
+//     bitmap of the frames received past ackThrough, so the sender knows
+//     exactly which window frames are missing. A frame is re-sent as
+//     soon as the bitmap PROVES it lost (3+ later seqs sacked above it —
+//     the RFC 9002 packet threshold — while its own bit is clear), or
+//     after fastRetxThreshold consecutive dup-acks (a repeated
+//     ackThrough with frames outstanding — the peer only acks after
+//     receiving data, so a repeated ackThrough means it saw something
+//     newer but is stuck on a gap), re-arming every fastRetxEvery
+//     further dup-acks while the hole persists. The retransmit set is
+//     exactly the proven-lost frames, shipped in ONE carrier message
+//     (never acked/sacked frames); with an empty bitmap it degrades to
+//     the TCP-style gap head;
 //   - RTO: no ack progress for max(Config.RetransmitInterval, 2×srtt),
 //     where srtt is a Karn-smoothed RTT sampled only from frames that
 //     were never retransmitted. The whole unacked window is then re-sent
@@ -42,6 +48,8 @@
 //	                     dropped BEFORE any other processing
 //	epoch         16 B   random per generation (New / NewGeneration)
 //	ackThrough     8 B   highest contiguous inbound seq the sender saw
+//	ackBits        8 B   SACK bitmap: bit i set = frame ackThrough+1+i
+//	                     sits in the reorder buffer (received)
 //	count          2 B   number of frames below
 //	frames        ...    [seq 8B][len 4B][payload]...
 //	mac           16 B   truncated HMAC-SHA256 over channelID..frames
@@ -106,6 +114,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -113,15 +122,16 @@ import (
 	"golang.org/x/crypto/hkdf"
 
 	"github.com/leon03131/fork-openflux/transport"
+	"github.com/leon03131/fork-openflux/utils"
 )
 
 const (
 	magicSize     = 4
 	channelIDSize = 8
 	epochSize     = 16
-	headerSize    = magicSize + channelIDSize + epochSize + 8 + 2 // 38
-	frameHeader   = 8 + 4                                         // 12: seq + len
-	macSize       = 16                                            // truncated HMAC-SHA256
+	headerSize    = magicSize + channelIDSize + epochSize + 8 + 8 + 2 // 46 (ackThrough + ackBits + count)
+	frameHeader   = 8 + 4                                             // 12: seq + len
+	macSize       = 16                                                // truncated HMAC-SHA256
 	crcSize       = 4
 
 	// Overhead is the worst-case per-user-message cost of the adapter
@@ -129,7 +139,7 @@ const (
 	// the CRC. MaxPayload reports the inner carrier's budget minus this.
 	// The MAC slot is reserved even when Config.MacKey is empty, keeping
 	// the window-fit invariant independent of the MAC knob.
-	Overhead = headerSize + frameHeader + macSize + crcSize // 70
+	Overhead = headerSize + frameHeader + macSize + crcSize // 78
 
 	// DefaultMaxUnackedFrames bounds the retransmit window in frames.
 	DefaultMaxUnackedFrames = 256
@@ -290,11 +300,14 @@ type Transport struct {
 	// owned by controlLoop; these drive its (re)arming.
 	srtt           time.Duration // smoothed RTT (Karn: never-retxed frames only)
 	lastAckThrough uint64        // largest ackThrough seen (dup-ack detection)
+	lastAckBits    uint64        // SACK bitmap of the most recent ack at lastAckThrough
 	dupStreak      int           // consecutive acks with no ack progress
 	lastFastRetx   int           // dupStreak value at the last fast retransmit
 
-	dropCnt  atomic.Uint64 // inbound messages rejected by the receive filter
-	txErrCnt atomic.Uint64 // swallowed carrier Send failures (healed by retransmit)
+	dropCnt        atomic.Uint64 // inbound messages rejected by the receive filter
+	txErrCnt       atomic.Uint64 // swallowed carrier Send failures (healed by retransmit)
+	retxCnt        atomic.Uint64 // frames re-sent (fast + RTO retransmits)
+	ackProgressCnt atomic.Uint64 // frames freed by cumulative-ack progress
 }
 
 // randomEpoch returns a fresh generation ID; time-based fallback if
@@ -438,6 +451,7 @@ func (t *Transport) NewGeneration() error {
 	// smoothed RTT survives: it is a property of the physical link, not
 	// of the generation.
 	t.lastAckThrough = 0
+	t.lastAckBits = 0
 	t.dupStreak = 0
 	t.lastFastRetx = 0
 	t.genSeq++
@@ -514,6 +528,14 @@ func (t *Transport) Dropped() uint64 { return t.dropCnt.Load() }
 // frame was already accepted into the window. These errors are swallowed
 // on purpose — the retransmit timer retries until the carrier heals.
 func (t *Transport) TransmitErrors() uint64 { return t.txErrCnt.Load() }
+
+// Retransmits reports how many frames were re-sent over the link's
+// lifetime (fast SACK retransmits + RTO full-window retransmits).
+func (t *Transport) Retransmits() uint64 { return t.retxCnt.Load() }
+
+// AckProgress reports how many frames were freed by cumulative-ack
+// progress over the link's lifetime.
+func (t *Transport) AckProgress() uint64 { return t.ackProgressCnt.Load() }
 
 // UnackedLen reports the current retransmit window occupancy in frames.
 func (t *Transport) UnackedLen() int {
@@ -662,6 +684,19 @@ func (t *Transport) buildMessageLocked(frames []outFrame, wireBytes int) []byte 
 	var tmp [8]byte
 	binary.BigEndian.PutUint64(tmp[:], t.nextDeliver-1) // ackThrough
 	buf = append(buf, tmp[:]...)
+	// SACK bitmap: bit i set = frame ackThrough+1+i (= nextDeliver+i)
+	// sits in the reorder buffer. Bit 0 (the gap head itself) is never
+	// set: a received gap head is delivered immediately, advancing
+	// ackThrough. Frames past the 64-bit horizon are not advertised —
+	// the sender treats them as unknown, not lost.
+	var sack uint64
+	for seq := range t.pending {
+		if off := seq - t.nextDeliver; off < 64 {
+			sack |= 1 << off
+		}
+	}
+	binary.BigEndian.PutUint64(tmp[:], sack) // ackBits
+	buf = append(buf, tmp[:]...)
 	var cnt [2]byte
 	binary.BigEndian.PutUint16(cnt[:], uint16(len(frames)))
 	buf = append(buf, cnt[:]...)
@@ -702,6 +737,13 @@ func (t *Transport) controlLoop() {
 	defer rtoTimer.Stop()
 	backoffShift := 0 // RTO multiplier is 1<<backoffShift; reset on progress
 
+	// Periodic observability: a 10 s heartbeat of the ARQ state, logged
+	// only when the link was active since the previous report (frames in
+	// flight, retransmits or ack progress) — an idle link stays quiet.
+	statsTicker := time.NewTicker(10 * time.Second)
+	defer statsTicker.Stop()
+	var lastStatsRetx, lastStatsAck uint64
+
 	// stopTimer disarms the RTO timer, draining a pending stale fire.
 	stopTimer := func() {
 		if !rtoTimer.Stop() {
@@ -718,6 +760,21 @@ func (t *Transport) controlLoop() {
 			return
 		case <-t.ctx.Done():
 			return
+		case <-statsTicker.C:
+			t.mu.Lock()
+			inFlight := t.unackedBytes
+			unacked := len(t.unacked)
+			srtt := t.srtt
+			rto := t.rtoLocked()
+			t.mu.Unlock()
+			retx := t.retxCnt.Load()
+			ackProg := t.ackProgressCnt.Load()
+			if inFlight == 0 && retx == lastStatsRetx && ackProg == lastStatsAck {
+				continue // no activity since the last report: do not spam
+			}
+			lastStatsRetx, lastStatsAck = retx, ackProg
+			utils.Debugf("[RELIABLE] bytesInFlight=%d unackedFrames=%d srtt=%v rto=%v retransmitsTotal=%d ackProgressTotal=%d",
+				inFlight, unacked, srtt, rto, retx, ackProg)
 		case <-t.resetTick:
 			// New data sent or ack progress made: restart the clock at
 			// the base RTO, or stop it when nothing is outstanding.
@@ -812,23 +869,84 @@ func (t *Transport) retransmitAll() {
 		t.unacked[i].retxed = true
 	}
 	msg := t.buildSnapshotLocked()
+	n := uint64(len(t.unacked))
 	t.mu.Unlock()
+	t.retxCnt.Add(n)
 	if err := t.transmit(msg); err != nil {
 		t.txErrCnt.Add(1)
 	}
 }
 
-// fastRetransmit re-sends only the oldest unacked frame (the gap head)
-// after dup-acks signalled a hole. Never touches acked frames.
+// highestSackedLocked is the highest seq the peer's SACK bitmap reports
+// as received (lastAckThrough itself when the bitmap is empty).
+// Caller must hold mu.
+func (t *Transport) highestSackedLocked() uint64 {
+	if t.lastAckBits == 0 {
+		return t.lastAckThrough
+	}
+	return t.lastAckThrough + uint64(bits.Len64(t.lastAckBits))
+}
+
+// sackLostLocked reports whether the SACK bitmap proves any unacked
+// frame lost: 3+ later seqs sacked above it (RFC 9002 packet threshold)
+// while its own bit is clear. Caller must hold mu.
+func (t *Transport) sackLostLocked() bool {
+	top := t.highestSackedLocked()
+	base := t.lastAckThrough + 1 // seq encoded by bitmap bit 0
+	for _, f := range t.unacked {
+		if f.seq+3 > top {
+			break // unacked is seq-ordered: nothing later qualifies either
+		}
+		if off := f.seq - base; off < 64 && t.lastAckBits&(1<<off) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// fastRetransmit re-sends exactly the frames the peer's SACK bitmap
+// proves lost (own bit clear, 3+ later seqs sacked — RFC 9002 packet
+// threshold), all in ONE carrier message; acked/sacked frames are never
+// re-sent. With no SACK information at all (empty bitmap) it degrades
+// to the TCP-style reaction: only the gap head (oldest unacked frame).
 func (t *Transport) fastRetransmit() {
 	t.mu.Lock()
 	if t.stopped || len(t.unacked) == 0 {
 		t.mu.Unlock()
 		return
 	}
-	t.unacked[0].retxed = true
-	msg := t.buildMessageLocked(t.unacked[:1], frameHeader+len(t.unacked[0].payload))
+	base := t.lastAckThrough + 1 // seq encoded by bitmap bit 0
+	top := t.highestSackedLocked()
+	var idx []int
+	wire := 0
+	for i, f := range t.unacked {
+		if f.seq+3 > top {
+			break // not provably lost (in flight or past the bitmap horizon)
+		}
+		if off := f.seq - base; off < 64 && t.lastAckBits&(1<<off) == 0 {
+			idx = append(idx, i)
+			wire += frameHeader + len(f.payload)
+		}
+	}
+	if len(idx) == 0 {
+		if t.lastAckBits != 0 {
+			// SACK is active but proves nothing yet — retransmitting
+			// would hit frames that are merely in flight.
+			t.mu.Unlock()
+			return
+		}
+		// No SACK info (pure dup-acks): re-send the gap head.
+		idx = []int{0}
+		wire = frameHeader + len(t.unacked[0].payload)
+	}
+	frames := make([]outFrame, len(idx))
+	for j, i := range idx {
+		t.unacked[i].retxed = true
+		frames[j] = t.unacked[i]
+	}
+	msg := t.buildMessageLocked(frames, wire)
 	t.mu.Unlock()
+	t.retxCnt.Add(uint64(len(frames)))
 	if err := t.transmit(msg); err != nil {
 		t.txErrCnt.Add(1)
 	}
@@ -880,30 +998,37 @@ func (t *Transport) onMessage(data []byte) {
 		return
 	}
 
-	// 1) Cumulative ack processing. A LARGER ackThrough is progress:
-	//    free everything the peer has contiguously seen, sample the RTT,
-	//    reset the dup-ack streak and the RTO clock. A REPEATED
-	//    ackThrough while frames are outstanding is a dup-ack: the peer
-	//    only acks after receiving data, so it saw something newer but
-	//    is stuck on a gap — after fastRetxThreshold consecutive
-	//    dup-acks, fast-retransmit the gap head. A smaller ackThrough is
-	//    stale (duplicated/reordered ack) and ignored.
+	// 1) Cumulative ack + SACK processing. A LARGER ackThrough is
+	//    progress: free everything the peer has contiguously seen,
+	//    sample the RTT, reset the dup-ack streak and the RTO clock; the
+	//    fresh SACK bitmap may additionally PROVE further holes (3+
+	//    later seqs sacked above a missing frame — RFC 9002 packet
+	//    threshold), so fast-retransmit those immediately instead of
+	//    waiting for more dup-acks or the RTO. A REPEATED ackThrough
+	//    while frames are outstanding is a dup-ack: the peer only acks
+	//    after receiving data, so it saw something newer but is stuck on
+	//    a gap — after fastRetxThreshold consecutive dup-acks,
+	//    fast-retransmit, re-arming every fastRetxEvery while the hole
+	//    persists. A smaller ackThrough is stale (duplicated/reordered
+	//    ack) and ignored, bitmap included.
 	if msg.ackThrough > t.lastAckThrough {
 		t.lastAckThrough = msg.ackThrough
+		t.lastAckBits = msg.ackBits
 		t.dupStreak = 0
 		t.lastFastRetx = 0
-		freed := false
+		freed := 0
 		now := time.Now()
 		for len(t.unacked) > 0 && t.unacked[0].seq <= msg.ackThrough {
 			f := t.unacked[0]
 			t.unackedBytes -= frameHeader + len(f.payload)
 			t.unacked = t.unacked[1:]
-			freed = true
+			freed++
 			if !f.retxed {
 				t.sampleRTTLocked(now.Sub(f.sentAt))
 			}
 		}
-		if freed {
+		if freed > 0 {
+			t.ackProgressCnt.Add(uint64(freed))
 			close(t.ackSignal) // wake blocked Senders
 			t.ackSignal = make(chan struct{})
 		}
@@ -911,7 +1036,14 @@ func (t *Transport) onMessage(data []byte) {
 		case t.resetTick <- struct{}{}: // restart the RTO clock
 		default:
 		}
+		if t.sackLostLocked() {
+			select {
+			case t.fastRetx <- struct{}{}:
+			default:
+			}
+		}
 	} else if msg.ackThrough == t.lastAckThrough && len(t.unacked) > 0 {
+		t.lastAckBits = msg.ackBits // freshest bitmap for the same base
 		t.dupStreak++
 		if t.dupStreak == fastRetxThreshold ||
 			(t.dupStreak > fastRetxThreshold && t.dupStreak-t.lastFastRetx >= fastRetxEvery) {
@@ -980,6 +1112,7 @@ type inFrame struct {
 type message struct {
 	epoch      [epochSize]byte
 	ackThrough uint64
+	ackBits    uint64 // SACK bitmap: bit i = frame ackThrough+1+i received
 	frames     []inFrame
 }
 
@@ -1018,9 +1151,11 @@ func (t *Transport) parseMessage(data []byte) (message, bool) {
 		}
 		limit = macStart
 	}
-	copy(m.epoch[:], data[magicSize+channelIDSize:headerSize-10])
-	m.ackThrough = binary.BigEndian.Uint64(data[headerSize-10 : headerSize-2])
-	count := int(binary.BigEndian.Uint16(data[headerSize-2 : headerSize]))
+	const ackOff = magicSize + channelIDSize + epochSize // 28
+	copy(m.epoch[:], data[magicSize+channelIDSize:ackOff])
+	m.ackThrough = binary.BigEndian.Uint64(data[ackOff : ackOff+8])
+	m.ackBits = binary.BigEndian.Uint64(data[ackOff+8 : ackOff+16])
+	count := int(binary.BigEndian.Uint16(data[ackOff+16 : headerSize]))
 	off := headerSize
 	for i := 0; i < count; i++ {
 		if limit-off < frameHeader {
